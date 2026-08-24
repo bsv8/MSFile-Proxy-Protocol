@@ -48,7 +48,14 @@ func Run(opts Options) error {
 	if err != nil {
 		return err
 	}
-	log.Emit("whitelist_loaded", map[string]any{"entries": wl.Size()})
+	log.Emit("whitelist_loaded", map[string]any{
+		"entries":   wl.Size(),
+		"allow_all": wl.AllowsAll(),
+		"note_zh":   "未配置白名单时允许任意已通过 Noise 身份认证的 secp256k1 客户端；仅限 demo",
+	})
+	if wl.AllowsAll() {
+		fmt.Fprintln(os.Stderr, "警告：demo 免白名单模式已启用；允许任意已认证的 secp256k1 客户端访问实验协议")
+	}
 
 	listenAddrs := opts.ListenAddrs
 	if len(listenAddrs) == 0 {

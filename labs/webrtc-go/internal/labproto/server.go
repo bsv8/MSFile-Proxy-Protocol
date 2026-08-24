@@ -50,7 +50,9 @@ func (s *Server) wrap(protocol string, serve func(network.Stream, connFacts) err
 			"direct":         facts.direct,
 			"limited":        facts.limited,
 		}
-		if !s.whitelist.Contains(facts.remotePubHex) {
+		// 即使 demo 处于免白名单模式，也必须成功取得并验证远端
+		// secp256k1 公钥；免除的只是业务白名单匹配，不是身份认证。
+		if factsErr != nil || !s.whitelist.Contains(facts.remotePubHex) {
 			reason := "public key not whitelisted"
 			if factsErr != nil {
 				reason = "remote key rejected: " + sanitizeErr(factsErr)

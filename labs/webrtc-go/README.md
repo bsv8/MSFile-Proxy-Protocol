@@ -56,9 +56,13 @@ go build -o msfile-webrtc-lab ./cmd/msfile-webrtc-lab
 
 msfile-webrtc-lab nas \
   --identity-key-file nas-test.key \
-  --listen /ip4/0.0.0.0/udp/4001/webrtc-direct \
+  --listen /ip4/0.0.0.0/udp/4001/webrtc-direct
+
+# demo 默认免白名单：允许任意已通过 Noise 身份认证的 secp256k1 客户端。
+# 需要验证白名单层时再增加（可重复）：
+msfile-webrtc-lab nas ... \
   --allow-public-key <browser-compressed-public-key-66-hex>
-# 可重复 --listen 与 --allow-public-key
+# --listen 同样可重复
 
 # 上游能力探针（当前恒为 UNSUPPORTED_UPSTREAM）：
 msfile-webrtc-lab nas ... --relay-listen /ip4/0.0.0.0/udp/4002/webrtc
@@ -70,6 +74,8 @@ stdout 输出结构化 JSONL 事件（字段规范见施工单 §13）。
 职责边界：
 
 - 从 connection 层 `RemotePublicKey()` 取真实远端公钥做白名单授权；
+- 未传 `--allow-public-key` 时进入 **demo 免白名单模式**，只跳过业务公钥匹配；
+  Noise 身份认证和 secp256k1 类型检查仍然执行。该模式不得用于生产；
 - 拒绝非 secp256k1 peer；
 - 只注册三个 lab protocol：
   `/msfile-lab/identity/1.0.0`、`/msfile-lab/echo/1.0.0`、`/msfile-lab/bytes/1.0.0`；

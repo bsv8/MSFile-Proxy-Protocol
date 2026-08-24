@@ -11,12 +11,13 @@ Subproject A）。TypeScript + Vite + js-libp2p 的纯静态网站，无 Node ba
 | Node.js | v22.13.1 |
 | pnpm | 11.5.1 |
 | libp2p | 3.3.9 |
-| @libp2p/webrtc | 6.0.30（同时导出 `webRTC()` 与 `webRTCDirect()`） |
+| @libp2p/webrtc | 6.0.30（官方未修改发行版；同时导出 `webRTC()` 与 `webRTCDirect()`） |
 | @libp2p/crypto | 5.1.23 |
 | @libp2p/circuit-relay-v2 | 4.2.12 |
 | @libp2p/peer-id | 6.0.15 |
 | @chainsafe/libp2p-noise / yamux | 17.0.0 / 8.0.1 |
 | @noble/hashes | 2.x |
+| Playwright | 1.62.1（真实 Chromium 全链路 E2E） |
 
 js-libp2p v3 为完全模块化：noise/yamux/identify/ping/websockets/circuit-relay 均需显式装配，
 见 `src/node.ts`。
@@ -41,9 +42,17 @@ pnpm install --frozen-lockfile
 pnpm test     # vitest：identity vector / framing / TURN 与 gate 单测
 pnpm build    # tsc --noEmit + vite build -> dist/
 pnpm dev      # 本地 loopback dev server（正式实验必须 HTTPS 部署）
+pnpm test:e2e:direct # 自动启动 Go NAS，用真实 Chromium 逐端口验证完整直连流程
 ```
 
 部署 `dist/` 到任意 HTTPS 静态托管即可；页面启动时校验 `window.isSecureContext`。
+
+`test:e2e:direct` 默认测试公网 `23.254.242.181` 的 `4001/3478/8443` UDP 端口，
+依次验证 WebRTC Direct、Noise 身份、identity 协议和 0/1/16384/262144 字节 echo。
+可通过 `MSFILE_E2E_PAGE_URL`、`MSFILE_E2E_NAS_PUBLIC_IP`、`MSFILE_E2E_PORTS`
+覆盖页面、IP 与端口；更换 NAS 身份时同步设置 `MSFILE_E2E_NAS_PUBLIC_KEY`、
+`MSFILE_E2E_NAS_PEER_ID`、`MSFILE_E2E_NAS_CERTHASH`。若 NAS 已在另一台机器运行，
+设置 `MSFILE_E2E_SKIP_GO=true`，脚本只负责浏览器侧并将结果标记为 external NAS。
 
 ## 页面角色
 

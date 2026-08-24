@@ -24,6 +24,10 @@ export interface ParsedIceConfig {
 
 export const DEFAULT_STUN_INPUT = 'stun:stun.l.google.com:19302'
 
+// js-libp2p 默认的单地址拨号超时只有 6 秒。公网链路上 ICE 检查可能已占用
+// 3～4 秒，导致 DTLS/SCTP/Noise 尚未完成就被浏览器主动取消。
+export const DIRECT_DIAL_TIMEOUT_MS = 30_000
+
 const TURN_URL_RE = /^turns?:/i
 
 export function parseIceServersInput(input: string): ParsedIceConfig {
@@ -107,6 +111,12 @@ export async function createNode(options: CreateNodeOptions): Promise<Libp2p<{ i
   }
   const node = await createLibp2p({
     privateKey,
+    connectionManager: {
+      // 两个值都要提高：dialTimeout 是整个拨号预算，addressDialTimeout 是
+      // 每个 multiaddr 的预算；后者不设置时仍会在 6 秒切断 WebRTC Direct。
+      dialTimeout: DIRECT_DIAL_TIMEOUT_MS,
+      addressDialTimeout: DIRECT_DIAL_TIMEOUT_MS
+    },
     addresses: {
       listen: listenAddrs
     },

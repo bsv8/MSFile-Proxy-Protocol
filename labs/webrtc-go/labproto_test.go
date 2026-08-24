@@ -260,6 +260,57 @@ func TestIdentityProtocolReportsConnectionTruth(t *testing.T) {
 	}
 }
 
+func TestEmptyWhitelistAllowsAuthenticatedSecp256k1Client(t *testing.T) {
+	nasPriv := keyFromHex(t, randomScalarHex(t))
+	clientPriv := keyFromHex(t, randomScalarHex(t))
+	clientID, err := identity.PeerID(clientPriv)
+	if err != nil {
+		t.Fatalf("client id: %v", err)
+	}
+
+	nasHost := buildHost(t, nasPriv)
+	clientHost := buildHost(t, clientPriv)
+	registerServer(t, nasHost, nil)
+	mustConnect(t, clientHost, nasHost)
+
+	stream := openStream(t, clientHost, nasHost.ID(), labproto.ProtocolIdentity)
+	defer stream.Close()
+	raw, err := io.ReadAll(io.LimitReader(stream, 64*1024))
+	if err != nil {
+		t.Fatalf("demo allow-all identity read: %v", err)
+	}
+	var diag map[string]any
+	if err := json.Unmarshal(raw, &diag); err != nil {
+		t.Fatalf("identity response not JSON (%q): %v", string(raw), err)
+	}
+	if diag["remote_peer_id"] != clientID.String() {
+		t.Fatalf("NAS observed remote peer %v, want %s", diag["remote_peer_id"], clientID)
+	}
+}
+
+func TestEmptyWhitelistStillRejectsNonSecp256k1Client(t *testing.T) {
+	nasPriv := keyFromHex(t, randomScalarHex(t))
+	clientPriv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate ed25519 client key: %v", err)
+	}
+
+	nasHost := buildHost(t, nasPriv)
+	clientHost := buildHost(t, clientPriv)
+	registerServer(t, nasHost, nil)
+	mustConnect(t, clientHost, nasHost)
+
+	stream := openStream(t, clientHost, nasHost.ID(), labproto.ProtocolIdentity)
+	defer stream.Close()
+	if err := stream.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	raw, _ := io.ReadAll(io.LimitReader(stream, 64*1024))
+	if len(raw) != 0 {
+		t.Fatalf("demo allow-all must reject non-secp256k1 client, got %q", string(raw))
+	}
+}
+
 func TestEchoAndBytesProtocolsOverRealConnections(t *testing.T) {
 	nasPriv := keyFromHex(t, randomScalarHex(t))
 	clientPriv := keyFromHex(t, randomScalarHex(t))

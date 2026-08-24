@@ -77,7 +77,7 @@ func runNas(args []string) error {
 	var listenAddrs repeatedString
 	fs.Var(&listenAddrs, "listen", "WebRTC Direct listen multiaddr (repeatable)")
 	var allowKeys repeatedString
-	fs.Var(&allowKeys, "allow-public-key", "whitelisted browser compressed public key hex, 66 chars (repeatable)")
+	fs.Var(&allowKeys, "allow-public-key", "浏览器压缩公钥 hex（66 字符，可重复）；不传时 demo 允许所有已认证 secp256k1 客户端")
 	relayListen := fs.String("relay-listen", "", "optional relay-signaled /webrtc listen multiaddr (probe only)")
 	if err := fs.Parse(args); err != nil {
 		return err

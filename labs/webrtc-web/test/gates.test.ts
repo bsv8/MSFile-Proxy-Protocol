@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
-import { parseIceServersInput, assertNoTurnInRtcConfiguration } from '../src/node'
+import { DIRECT_DIAL_TIMEOUT_MS, parseIceServersInput, assertNoTurnInRtcConfiguration } from '../src/node'
 import { evaluateDirectGate } from '../src/direct'
 import { isPairAllowedForTransfer } from '../src/stats'
 import { deriveIdentity } from '../src/identity'
@@ -51,6 +51,10 @@ function pair(localType: string, remoteType: string): SelectedCandidatePair | un
 }
 
 describe('TURN hard rejection (T10)', () => {
+  it('为公网 WebRTC Direct 握手保留足够的拨号时间', () => {
+    expect(DIRECT_DIAL_TIMEOUT_MS).toBeGreaterThanOrEqual(30_000)
+  })
+
   it('accepts stun urls only', () => {
     const parsed = parseIceServersInput('stun:stun.example.com:3478')
     expect(parsed.turnRejected).toBe(false)

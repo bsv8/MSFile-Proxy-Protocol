@@ -121,8 +121,14 @@ func TestWhitelistMatching(t *testing.T) {
 	if err != nil {
 		t.Fatalf("empty whitelist: %v", err)
 	}
-	if empty.Contains(v.PublicKeyHex) {
-		t.Fatal("empty whitelist must match nothing")
+	if !empty.AllowsAll() {
+		t.Fatal("empty whitelist must enable demo allow-all mode")
+	}
+	if !empty.Contains(v.PublicKeyHex) {
+		t.Fatal("empty whitelist must allow an authenticated secp256k1 key in demo mode")
+	}
+	if wl.AllowsAll() {
+		t.Fatal("non-empty whitelist must not enable demo allow-all mode")
 	}
 	if _, err := identity.NewWhitelist([]string{"nothex"}); err == nil {
 		t.Fatal("expected malformed whitelist entry to fail")
