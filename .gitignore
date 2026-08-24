@@ -141,3 +141,8 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Go lab binaries and test keys
+labs/webrtc-go/msfile-webrtc-lab
+labs/webrtc-go/*.key
+*.test.key

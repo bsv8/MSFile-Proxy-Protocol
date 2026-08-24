@@ -1,0 +1,76 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+  line-height: 1.45;
+}
+
+body {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 1rem;
+}
+
+h1, h2 {
+  border-bottom: 1px solid #8884;
+}
+
+section {
+  margin-bottom: 1.5rem;
+}
+
+.grid > div {
+  margin: 0.25rem 0;
+  word-break: break-all;
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  margin: 0.5rem 0;
+}
+
+label {
+  display: block;
+  margin: 0.35rem 0;
+}
+
+input[type="text"], input[type="password"], input[type="number"], select, textarea {
+  min-width: 320px;
+  padding: 0.3rem;
+}
+
+code {
+  font-family: ui-monospace, monospace;
+  font-size: 0.85rem;
+  word-break: break-all;
+}
+
+pre {
+  background: #8881;
+  padding: 0.5rem;
+  overflow-x: auto;
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+
+.warning {
+  color: #b00;
+  font-weight: 600;
+}
+
+#log-pane {
+  height: 260px;
+  overflow-y: auto;
+  background: #111;
+  color: #cfc;
+  font-family: ui-monospace, monospace;
+  font-size: 0.75rem;
+  padding: 0.5rem;
+}
+
+.log-line {
+  white-space: pre-wrap;
+  word-break: break-all;
+}

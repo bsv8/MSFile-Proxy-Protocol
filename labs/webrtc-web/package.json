@@ -1,0 +1,41 @@
+{
+  "name": "@msfile-labs/webrtc-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MSFile lab: js-libp2p WebRTC + same-key identity browser experiment (test-only keys)",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@chainsafe/libp2p-noise": "17.0.0",
+    "@chainsafe/libp2p-yamux": "8.0.1",
+    "@libp2p/circuit-relay-v2": "4.2.12",
+    "@libp2p/crypto": "5.1.23",
+    "@libp2p/identify": "4.1.13",
+    "@libp2p/interface": "3.3.0",
+    "@libp2p/peer-id": "6.0.15",
+    "@libp2p/ping": "3.1.12",
+    "@libp2p/webrtc": "6.0.30",
+    "@libp2p/websockets": "~10.1.20",
+    "@multiformats/multiaddr": "^13.0.3",
+    "@multiformats/multiaddr-matcher": "3.0.2",
+    "@noble/hashes": "^2.3.0",
+    "it-pushable": "^3.2.3",
+    "libp2p": "3.3.9",
+    "uint8array-extras": "^1.4.0",
+    "uint8arraylist": "^3.0.2",
+    "uint8arrays": "^5.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vite": "^7.1.14",
+    "vitest": "^4.1.11"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

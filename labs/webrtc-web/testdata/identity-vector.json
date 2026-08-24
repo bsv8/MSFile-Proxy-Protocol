@@ -1,0 +1,7 @@
+{
+  "$comment": "MSFile lab fixed cross-language identity vector. TEST-ONLY: the private key has no funds and no production permissions. Go (go-libp2p v0.49.0) and TypeScript (@libp2p/crypto 5.x) must both derive public_key_hex and peer_id from private_key_hex independently and match exactly.",
+  "name": "vector-a",
+  "private_key_hex": "278d5bed18a82b66619e026c2efb2a907e35310829d9658fb967180636afaa6a",
+  "public_key_hex": "02e940822d4e7a09ce013bed4fa812e92f22b0ed1fa2d1ad06ae0406680da1cc46",
+  "peer_id": "16Uiu2HAmB8C2R7pBJu1z2u1gno7aXcbtkoUzrknTFN2EBLjRavKP"
+}

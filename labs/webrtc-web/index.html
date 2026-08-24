@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MSFile WebRTC Lab (test-only keys)</title>
+    <link rel="stylesheet" href="/src/ui.css" />
+  </head>
+  <body>
+    <header>
+      <h1>MSFile WebRTC Lab</h1>
+      <p class="warning">实验页面：仅允许 test-only 私钥。私钥只存在于页面内存，不会进入日志、URL 或 localStorage。</p>
+    </header>
+
+    <section id="diagnostics">
+      <h2>环境诊断</h2>
+      <div class="grid">
+        <div>isSecureContext: <span id="diag-secure-context">?</span></div>
+        <div>UserAgent: <span id="diag-user-agent">?</span></div>
+        <div>WebRTC API: <span id="diag-webrtc-available">?</span></div>
+        <div>STUN list: <textarea id="stun-list" rows="2">stun:stun.l.google.com:19302</textarea></div>
+        <div>TURN 检查: <span id="diag-turn-status">?</span></div>
+      </div>
+    </section>
+
+    <section id="identity">
+      <h2>Identity（业务密钥 == libp2p 身份密钥）</h2>
+      <div class="row">
+        <button id="btn-generate-key">生成 test 私钥</button>
+        <input id="input-private-key" type="password" placeholder="64 hex chars test-only private key" autocomplete="off" spellcheck="false" />
+        <button id="btn-import-key">导入 test 私钥</button>
+      </div>
+      <div class="grid">
+        <div>压缩公钥 (33B): <code id="id-public-key">(none)</code></div>
+        <div>PeerId: <code id="id-peer-id">(none)</code></div>
+        <div>同钥声明: <span id="id-key-match">inactive</span></div>
+      </div>
+
+      <div class="row">
+        <label>角色
+          <select id="select-role">
+            <option value="direct-dialer">direct-dialer（拨 Go NAS）</option>
+            <option value="private-listener">private-listener（Relay 上等待 Browser）</option>
+            <option value="private-dialer">private-dialer（经 Relay 发起 WebRTC）</option>
+          </select>
+        </label>
+        <button id="btn-start-node">启动节点</button>
+        <button id="btn-stop-node">停止节点</button>
+      </div>
+      <div class="grid">
+        <div>节点状态: <span id="node-status">stopped</span></div>
+        <div>节点 PeerId: <code id="node-peer-id"></code></div>
+      </div>
+      <pre id="node-addrs"></pre>
+    </section>
+
+    <section id="direct">
+      <h2>WebRTC Direct -&gt; Go NAS</h2>
+      <label>NAS multiaddr（含 /webrtc-direct/certhash）
+        <input id="input-nas-multiaddr" placeholder="/ip4/../udp/4001/webrtc-direct/certhash/../p2p/16Uiu2..." spellcheck="false" />
+      </label>
+      <label>NAS 压缩公钥 hex（pin）
+        <input id="input-nas-pubkey" placeholder="33 bytes = 66 hex chars" spellcheck="false" />
+      </label>
+      <div class="row">
+        <button id="btn-direct-dial">拨号 + identity + echo</button>
+        <button id="btn-direct-bytes" disabled>bytes 大块传输</button>
+      </div>
+      <label>总量 GiB <input id="input-total-gib" type="number" min="0.001" max="8" step="0.001" value="1" /></label>
+      <label>并发 stream 数 <input id="input-streams" type="number" min="1" max="8" value="4" /></label>
+      <label>逻辑块大小 <input id="input-block-bytes" type="number" min="1024" max="1048576" step="1024" value="262144" /></label>
+      <pre id="bytes-progress"></pre>
+    </section>
+
+    <section id="private">
+      <h2>Relay-signaled WebRTC（Browser &lt;-&gt; Browser 控制组）</h2>
+      <fieldset>
+        <legend>private-listener</legend>
+        <label>Relay multiaddr（WSS）
+          <input id="input-relay-multiaddr" placeholder="/dns4/.../tcp/443/wss/p2p/16Uiu2..." spellcheck="false" />
+        </label>
+        <div class="row">
+          <button id="btn-reserve-relay">连接 Relay 并建立 reservation</button>
+          <button id="btn-wait-incoming">等待对端直连</button>
+        </div>
+        <label>预期 dialer 压缩公钥 hex（listener 必须认证拨号方）
+          <input id="input-dialer-pubkey" placeholder="66 hex chars" spellcheck="false" />
+        </label>
+        <div>可复制给 dialer 的地址：</div>
+        <pre id="relay-reservation"></pre>
+      </fieldset>
+      <fieldset>
+        <legend>private-dialer</legend>
+        <label>目标 listener multiaddr
+          <input id="input-target-multiaddr" placeholder="/dns4/.../wss/p2p/&lt;relay&gt;/p2p-circuit/webrtc/p2p/&lt;listener&gt;" spellcheck="false" />
+        </label>
+        <label>目标 listener 压缩公钥 hex（pin）
+          <input id="input-target-pubkey" placeholder="66 hex chars" spellcheck="false" />
+        </label>
+        <button id="btn-private-dial">经 Relay 发起 WebRTC + gate</button>
+      </fieldset>
+    </section>
+
+    <section id="results">
+      <h2>连接事实与结果</h2>
+      <div class="grid">
+        <div>remote PeerId: <code id="fact-remote-peer-id"></code></div>
+        <div>expected PeerId: 由 pin 公钥派生比对</div>
+        <div>connection.direct: <span id="fact-direct"></span></div>
+        <div>connection.limits: <span id="fact-limits"></span></div>
+        <div>transport: <span id="fact-transport"></span></div>
+        <div>selected candidate pair: <span id="fact-candidate-pair"></span></div>
+        <div>RTT: <span id="fact-rtt"></span></div>
+      </div>
+      <pre id="identity-response"></pre>
+      <pre id="echo-summary"></pre>
+    </section>
+
+    <section id="log">
+      <h2>结构化 JSONL 日志（无私钥/SDP/payload）</h2>
+      <div id="log-pane" aria-live="polite"></div>
+    </section>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

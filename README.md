@@ -22,3 +22,12 @@ JSON、Base64 或十六进制包装。
 ## 实验施工单
 
 - [libp2p WebRTC 与同钥身份互通实验](./施工单/20260824/1-libp2p-webrtc与同钥身份互通实验施工单.md)
+
+## 实验代码
+
+- [labs/webrtc-web](./labs/webrtc-web/) — TypeScript + js-libp2p HTTPS 静态网站
+  （direct-dialer / private-listener / private-dialer）
+- [labs/webrtc-go](./labs/webrtc-go/) — Go NAS / Relay 实验服务
+  （`msfile-webrtc-lab nas|relay`）
+- [WebRTC 互联实验报告](./docs/labs/webrtc-interop-report.zh.md) — Gate 0 版本审计与
+  T01–T14 矩阵证据
