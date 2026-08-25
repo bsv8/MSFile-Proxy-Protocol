@@ -2,9 +2,8 @@
 
 > 状态：V1 网络设计真值。
 >
-> 本文只定义 MSFile 节点身份、Proxy 设置、libp2p over WebRTC 建连、两种直连模式、
-> Circuit Relay 信令边界、直连验证、连接状态和网络验收。具体命令、CBOR Header、raw
-> attachment 和错误报文见
+> 本文定义 MSFile 的供应商身份、libp2p transport、连接认证、双 stream 模型和多供应商调度。
+> CBOR Header、raw attachment、请求覆盖和错误报文见
 > [MSFile Proxy Wire Messages v1](./wire-messages.zh.md)。
 
 ---
@@ -13,47 +12,72 @@
 
 MSFile V1 网络层统一规定：
 
-1. Keymaster Browser 运行 js-libp2p，NAS/BitFSProxy 运行兼容的 libp2p 实现；
-2. 业务数据只通过 WebRTC DataChannel 上的 libp2p stream 传输；
-3. 同时支持 `webRTCDirect` 和 `webRTC` 两种 transport；
-4. `webRTCDirect` 用于浏览器直接拨入具有可达 UDP 地址的 Proxy；
-5. `webRTC` 用于两个 NAT 后节点借助 Circuit Relay 交换 SDP/ICE 后建立 WebRTC 直连；
-6. Circuit Relay 只允许承载 reservation、SDP 和 ICE 信令，严禁承载 MSFile stream；
-7. TURN、`turn:`、`turns:` 和任何文件数据 Relay 回退均不属于 V1；
-8. ICE 打洞失败时 Proxy 不可达，不能降级为经 Relay 读取；
-9. libp2p identity 使用业务身份同一把 secp256k1 私钥；
-10. Proxy 从已认证 connection 取得远端压缩公钥并执行白名单授权；
-11. MSFile 只在通过 `direct_ready` 验证的具体 connection 上打开 stream；
-12. Proxy 可以同时发布两类地址，客户端优先尝试 WebRTC Direct，再尝试 Relay-signaled
-    WebRTC；
-13. libp2p/WebRTC 内部版本可以升级，但不得改变本文可观察的直连、安全和报文边界。
+1. Keymaster/客户端和供应商都运行兼容的 libp2p 实现；
+2. 只支持 WebRTC Direct 与 WebSocket/WSS 两种 libp2p transport；
+3. MSFile 不直接运行在裸 RTCDataChannel 或裸 WebSocket 上；
+4. WebRTC Direct 适合供应商具有客户端可达 UDP 地址的场景；
+5. WSS 是浏览器到服务器/NAS 的生产环境 TCP/TLS 直连路径；
+6. WS 只用于本机开发或受控可信网络；
+7. 不使用 relay-signaled WebRTC、Circuit Relay 或文件数据中转；
+8. 节点 identity 使用业务身份同一把 secp256k1 私钥；
+9. 供应商 ID 是 libp2p 已认证出的 33 字节压缩公钥；
+10. PeerId 从该公钥按 libp2p 规则派生，不是另一套供应商 ID；
+11. libp2p 已完成连接握手、密钥证明和协议协商，MSFile 不增加应用层握手；
+12. 每个供应商 connection 使用一条 Stat stream 和至多一条 Read stream；
+13. Stat 对所有已启用供应商并发发送，Read 按供应商公钥定向发送；
+14. connection、stream 和业务 Frame 是三个不同生命周期，不能相互代替。
 
 ---
 
 ## 2. 分层模型
 
+### 2.1 WebRTC Direct
+
 ```text
-Keymaster / Connect App
-  └── msfile.service
-       └── /msfile/1.0.0 stream
-            └── libp2p authenticated connection
-                 └── WebRTC DataChannel
-                      └── selected ICE candidate pair
+Keymaster / Client
+  └── MSFile Stat stream + Read stream
+       └── libp2p authenticated connection
+            └── WebRTC Direct transport
+                 └── reliable RTCDataChannel streams
+                      └── UDP/IP
 ```
 
-Connect App 不直接取得 libp2p host、私钥、RTCPeerConnection 或 Proxy 白名单。App 只调用
-Keymaster 暴露的 `msfile.service`；Keymaster 负责节点身份、连接验证、请求调度和内容校验。
+WebRTC Direct transport 使用 WebRTC DataChannel 自带的 stream multiplexing。每条 libp2p stream
+对应独立 DataChannel；MSFile 不自行管理 DataChannel ID。
 
-传输关系不能写成“WebRTC 上再启动一个可能回退 Relay 的文件服务”。MSFile stream 的唯一
-合法底层是已经形成的 WebRTC connection。
+### 2.2 WSS
+
+```text
+Keymaster / Browser
+  └── MSFile Stat stream + Read stream
+       └── libp2p authenticated connection
+            └── Noise + Yamux
+                 └── WebSocket
+                      └── TLS/TCP/IP
+```
+
+WSS 的 TLS 证书认证域名并保护 WebSocket 接入，但不替代 libp2p 节点身份认证。V1 的 WSS
+实现使用 Noise 认证远端 PeerId，并使用 Yamux 在一个 connection 上复用 stream。
+
+### 2.3 应用边界
+
+Connect App 不直接取得 libp2p host、私钥、RTCDataChannel 或 WebSocket。App 只调用 Keymaster
+提供的 MSFile service；Keymaster 负责：
+
+- 节点身份与私钥隔离；
+- 供应商公钥 pin；
+- 地址选择和连接复用；
+- Stat 广播与结果聚合；
+- Read 定向调度；
+- Frame、哈希、尺寸和价格授权校验。
 
 ---
 
-## 3. 节点身份
+## 3. 节点身份与认证
 
 ### 3.1 密钥口径
 
-Keymaster 和 Proxy 都必须使用：
+客户端和供应商必须使用：
 
 ```text
 key_type          = secp256k1
@@ -61,539 +85,373 @@ private_key_bytes = 32 bytes
 public_key_bytes  = 33-byte SEC1 compressed public key
 ```
 
-压缩公钥首字节必须是 `0x02` 或 `0x03`。配置和日志展示使用 66 个小写 hex 字符；连接和
-密码学内部使用原始字节。
+压缩公钥首字节必须是 `0x02` 或 `0x03`。配置与展示可以使用 66 个小写 hex 字符；wire、授权和
+密码学内部使用原始 33 字节。
 
-节点把该业务私钥作为 libp2p identity private key。PeerId 从对应公钥按 libp2p 标准派生：
+节点把业务私钥作为 libp2p identity private key：
 
 ```text
 business_private_key
-  ├── business_public_key
+  ├── supplier/client public key
   └── libp2p PeerId
 ```
 
-不得再生成一把与业务身份无关的临时 libp2p 私钥，也不得在报文中自报另一把业务公钥。
+不得另建一把与业务身份无关的临时 libp2p 私钥，也不得在 MSFile Frame 内自报另一把公钥。
 
-### 3.2 Keymaster Vault 边界
+### 3.2 `supplier_id`
 
-“使用同一把私钥”不表示插件或 Connect App可以读取 raw private key。
+MSFile 的供应商身份定义为：
 
-Keymaster 实现必须满足：
+```text
+supplier_id = authenticated_remote_secp256k1_public_key
+```
 
-- libp2p identity 由 Keymaster 受信任核心或 Vault 控制的运行时持有；
-- 普通插件和 Connect App 只能取得 `msfile.service` capability；
-- Vault 锁定时立即停止 libp2p host 并关闭全部 MSFile connection；
-- active key 切换时关闭旧 host，以新业务密钥重建 host；
-- key 切换后 PeerId 同步变化；
-- 不得把 raw private key 写入 localStorage、日志、错误、配置或跨 App 消息。
+- 二进制形态是 33 字节压缩公钥；
+- UI、日志和配置可以显示为 66 字符小写 hex；
+- PeerId 是它的 libp2p 派生标识，用于 multiaddr 与连接层；
+- 响应属于哪个供应商，由承载响应的 authenticated connection 决定；
+- StatResponse、ReadResponse 和 ErrorResponse 不携带 `supplier_id` 字段。
 
-如果 js-libp2p 的当前 PrivateKey 接口要求长期持有 raw key，实现必须把这项能力限制在受信任
-运行时中，不能为方便接入而扩散 Vault 解密结果。
+客户端不能信任报文、文件名、Seed 或 URL 中声明的供应商身份。
 
-### 3.3 Proxy 白名单
+### 3.3 libp2p 握手已经足够
 
-Proxy 白名单保存允许访问服务的 33 字节压缩公钥，并可以为每个公钥配置：
+WebRTC Direct 规范在专用 DataChannel 上执行绑定 DTLS fingerprint 的 Noise XX 身份认证，
+认证成功后才使用普通 DataChannel 承载 protocol stream。WSS 路径在 transport upgrade 中执行
+Noise，并在其后使用 Yamux。
 
-- 是否允许 `stat(discover=false)`；
-- 是否允许 `stat(discover=true)`；
-- 是否允许本地 `read`；
-- 是否允许 `acquire` 和 acquisition read；
-- 并发 stream、带宽和预算上限。
+因此 MSFile 不再定义 `Hello`、challenge、重复公钥交换、应用签名或 session token。开始处理
+`/msfile/1.0.0` Frame 前，实现只需确认：
 
-授权真值必须来自 libp2p 握手认证后的 remote public key。Proxy 禁止信任：
+1. libp2p connection 已完成身份认证；
+2. remote PeerId 与认证出的 remote public key 一致；
+3. remote public key 满足本地白名单或授权策略；
+4. connection 使用本文允许的 transport。
 
-- 报文字段中的公钥；
-- 调用方声明的 PeerId；
-- 推荐文件名、Seed 或 quote 中的身份字段；
-- WebRTC DTLS certhash 作为业务身份。
+### 3.4 双向 pin 与白名单
 
-Proxy 可以把白名单公钥预先派生成 PeerId，在 secure connection gater 阶段尽早拒绝；最终
-MSFile stream handler 仍必须使用 connection 上的远端身份执行授权。
+客户端必须 pin 供应商公钥：
 
-### 3.4 双向认证
+1. 从 `supplier_public_key` 派生期望 PeerId；
+2. 配置地址尾部 `/p2p/<peer-id>` 必须与期望 PeerId 一致；
+3. libp2p 握手认证出的远端身份必须再次一致；
+4. 任一不一致都关闭 connection，不提供“仍然继续”选项。
 
-客户端也必须确认连接的是目标 Proxy：
+供应商按 authenticated client public key 授权至少以下能力：
 
-1. Proxy 设置包含期望压缩公钥；
-2. 从该公钥派生期望 PeerId；
-3. 每个配置 multiaddr 的 `/p2p/<peer-id>` 必须与其一致；
-4. libp2p secure handshake 认证出的 remote PeerId 必须再次一致；
-5. 任一不一致都关闭 connection，不能提示用户忽略。
+- 是否允许 Stat；
+- 是否允许 Read Seed；
+- 是否允许 Read 文件块；
+- 单次与累计预算策略；
+- 请求频率、并发、带宽和缓存上限。
 
-libp2p Noise 负责证明对端持有 PeerId 对应私钥并保护连接；公钥白名单负责业务授权；
-MasterSeed 负责文件内容完整性。这三个边界不得混为一层。
+报文没有 API Key、Bearer Token、Cookie 或客户端公钥字段。
+
+### 3.5 Keymaster Vault 边界
+
+“使用同一把私钥”不表示 Connect App 可以读取 raw private key：
+
+- libp2p identity 只由 Keymaster 受信任核心或 Vault 运行时持有；
+- Vault 锁定时停止 libp2p host 并关闭全部供应商 connection；
+- active key 切换时关闭旧 host，以新密钥重建，PeerId 随之变化；
+- 私钥不得写入 localStorage、日志、错误、配置或跨 App 消息。
 
 ---
 
-## 4. Proxy 设置
+## 4. 供应商配置与地址
 
-Keymaster 的一条配置型 Proxy 至少包含：
+每个供应商至少配置：
 
 ```text
-name
-proxy_public_key
-addresses[]
+name                 // 本地显示名称，不进入 wire
+supplier_public_key  // 33 字节压缩 secp256k1 公钥
+addresses[]          // 一个或多个可拨号 libp2p multiaddr
+enabled              // 是否参加 Stat 并发查询
 ```
 
-例如：
+WebRTC Direct 示例：
 
 ```text
-name = home-nas
-proxy_public_key = 02...
+/dns4/nas.example.com/udp/4001/webrtc-direct/certhash/<multihash>/p2p/<supplier-peer-id>
+```
 
-addresses = [
-  /dns4/nas.example.com/udp/4001/webrtc-direct/certhash/<hash>/p2p/<nas-peer-id>,
-  /dns4/relay.example.com/tcp/443/wss/p2p/<relay-peer-id>/p2p-circuit/webrtc/p2p/<nas-peer-id>
-]
+WSS 推荐规范形态：
+
+```text
+/dns4/proxy.example.com/tcp/443/tls/ws/p2p/<supplier-peer-id>
+```
+
+实现可以接受 libp2p 库规范化后的 `/wss` 别名，但持久化和文档输出应优先使用
+`/tls/ws` 形态。开发环境 WS 示例：
+
+```text
+/ip4/127.0.0.1/tcp/8080/ws/p2p/<supplier-peer-id>
 ```
 
 规范性规则：
 
-- `proxy_public_key` 必须是合法的压缩 secp256k1 公钥；
-- 每个 address 必须是合法 libp2p multiaddr；
-- 最终目标 `/p2p/` 必须等于该公钥派生的 PeerId；
-- address 只能属于本文定义的 `webrtc-direct` 或 relay-signaled `webrtc`；
-- 配置不包含 API Key、HTTP URL、Bearer Token 或用户名密码；
-- Relay 地址中的 Relay PeerId 与 Proxy PeerId 是两个不同身份；
-- 用户可以为同一 Proxy 配置多个网络地址；
-- Keymaster 内部 Proxy ID 可以由配置记录生成，但不是 wire 字段；
-- 内置静态文件源可以直接实现 `msfile.service` Adapter，不要求绕行 WebRTC。
-
-地址发现、二维码、配对码和 DDNS 更新机制不进入 V1 wire；它们最终必须产生上述公钥和
-multiaddr 真值。
+- `supplier_public_key` 必须能派生地址中的最终 PeerId；
+- address 只能是 `webrtc-direct`、`ws` 或 `tls/ws`；
+- 生产浏览器不得通过不安全公网 WS 发送 MSFile 数据；
+- 一个供应商可以同时发布 WebRTC Direct 和 WSS 地址；
+- 地址优先级是本地策略，不是 wire 字段；
+- DNS、DDNS、二维码和配对流程不进入 MSFile wire，最终只产生公钥与 multiaddr。
 
 ---
 
-## 5. 模式 A：WebRTC Direct
+## 5. Transport 行为
 
-### 5.1 用途
+### 5.1 WebRTC Direct
 
-WebRTC Direct 用于 Proxy 具有浏览器可达 UDP listener 的场景：
+WebRTC Direct 用于供应商具有客户端可达 UDP listener 的场景，例如公网 IPv6、公网 IPv4 或
+稳定 UDP 端口映射。
 
-- 公网 IPv6；
-- 公网 IPv4；
-- 路由器静态 UDP 端口映射；
-- UPnP、NAT-PMP 或 PCP 建立的稳定 UDP 映射。
+拨号前必须：
 
-```text
-Browser/js-libp2p
-        ═════ WebRTC Direct ═════>
-Proxy/go-libp2p UDP listener
-```
+- 校验 multiaddr 的 PeerId 与供应商公钥一致；
+- 校验 `/certhash` 格式；
+- 限制拨号超时和并发；
+- 禁止在身份认证完成前发送 MSFile Frame。
 
-浏览器只能拨号，不能作为 WebRTC Direct listener。Proxy 发布的 multiaddr 必须包含：
+WebRTC Direct 的 DTLS 负责 DataChannel 机密性和完整性；绑定 fingerprint 的 libp2p Noise
+握手负责远端 PeerId 身份认证。两者都不能替代内容 SHA-256 校验。
 
-```text
-network address
-udp port
-/webrtc-direct
-/certhash/<certificate-hash>
-/p2p/<proxy-peer-id>
-```
+供应商没有可达 UDP 地址时，客户端直接把该地址报告为不可达，并尝试同一供应商配置的 WSS
+地址或其他供应商。
 
-### 5.2 Certhash
+### 5.2 WebSocket/WSS
 
-`certhash` 是 WebRTC DTLS 证书指纹，不是 PeerId，也不是业务公钥哈希。
+WSS 用于供应商通过 HTTPS 基础设施、反向代理或标准 443/TCP 对浏览器提供服务的场景。
 
-Proxy 应持久化 WebRTC certificate/key，使重启后 certhash 稳定。若证书轮换导致 certhash
-变化，旧 multiaddr 必须失效并通过配置/发现机制发布新地址。
+- 浏览器通常只能作为 WebSocket dialer，供应商负责监听；
+- TLS 证书必须由浏览器/运行环境信任，域名必须匹配；
+- 反向代理必须把二进制 WebSocket 字节透明转发给 libp2p listener；
+- 反向代理不得解析、重写或缓存 MSFile Frame；
+- WSS 建连成功后仍必须完成 libp2p Noise 与 PeerId pin；
+- WSS connection 使用 Yamux 提供独立 libp2p stream。
 
-客户端必须同时验证 certhash 和 PeerId，不能用其中一个代替另一个。
+WS 没有 TLS，只允许 loopback、本机集成测试或明确受控的可信网络。即使使用 WS，libp2p Noise
+仍然必须开启。
 
-### 5.3 不可达边界
+### 5.3 地址选择
 
-WebRTC Direct 不通过第三方交换 SDP。普通 NAT 后且没有可达端口映射的 Proxy 不能仅靠
-STUN 变成 Direct listener。
-
-以下情况 Direct 可以失败：
-
-- CGNAT 且无公网 IPv6；
-- UDP 入站映射不存在或过期；
-- 防火墙阻断；
-- DDNS 或 certhash 已过期。
-
-失败后客户端可以尝试模式 B，但不得经 Circuit Relay 直接打开 MSFile stream。
-
----
-
-## 6. 模式 B：Relay-signaled WebRTC
-
-### 6.1 用途
-
-该模式用于 Browser 和 Proxy 都位于 NAT 后，但 NAT/防火墙仍允许 WebRTC ICE 打洞的
-场景。
+客户端按供应商分别维护地址健康状态，可以基于历史成功率、RTT 和本地网络选择地址：
 
 ```text
-阶段 1：信令
-
-Browser ── Circuit Relay ── Proxy
-          SDP + ICE only
-
-阶段 2：业务数据
-
-Browser ═══ selected ICE pair / WebRTC DataChannel ═══ Proxy
-          Circuit Relay 不在数据路径中
-```
-
-Proxy 先在 Circuit Relay v2 建立 reservation，并发布形如：
-
-```text
-<relay-address>/p2p/<relay-peer-id>/p2p-circuit/webrtc/p2p/<proxy-peer-id>
-```
-
-客户端通过 relay circuit 打开 libp2p WebRTC signaling protocol，交换 SDP 和 ICE
-candidate。`RTCPeerConnection` 进入 connected 后：
-
-- signaling stream 必须关闭；
-- 新的 WebRTC connection 成为 MSFile 候选 connection；
-- Relay reservation/control connection 可以继续存在以服务未来拨号；
-- MSFile 不得在 signaling circuit connection 上打开。
-
-### 6.2 STUN 与 TURN
-
-V1 允许 STUN，因为 STUN 只帮助发现地址和执行连通性检查，不转发文件数据。
-
-配置加载时必须：
-
-- 允许 `stun:` URL；
-- 拒绝 `turn:` URL；
-- 拒绝 `turns:` URL；
-- 拒绝 TURN username、credential 和 relay-only ICE policy；
-- 不提供“打洞失败后使用 TURN”的开关。
-
-ICE 打洞可能在普通家庭 NAT 下成功，也可能在对称 NAT、部分 CGNAT、多层 NAT、企业网络
-或 UDP 受限网络下失败。V1 接受“不能直连就不可达”，不追求所有网络可用。
-
-### 6.3 Circuit Relay 的允许流量
-
-Relay connection 只允许：
-
-- libp2p connection 建立与 identify 所需最小控制流量；
-- Circuit Relay v2 reservation/control；
-- libp2p WebRTC signaling protocol；
-- SDP offer/answer；
-- ICE candidates 和连通状态。
-
-明确禁止：
-
-- `/msfile/1.0.0` stream；
-- Seed attachment；
-- 文件块 attachment；
-- Stat、Acquire、Read Header；
-- 把 Relay 当作 ICE 失败后的文件传输回退。
-
-“Relay connection 仍保持在线”不表示 Relay 仍参与已经形成的 WebRTC DataChannel。保留
-reservation 是为了后续连接；是否参与某一 MSFile 传输必须由第 8 节的验证规则判断。
-
----
-
-## 7. 地址选择与建连策略
-
-同一 Proxy 可以同时发布两类地址。建议顺序：
-
-1. 尝试已知可用的 `webrtc-direct` 地址；
-2. Direct 超时或不可达时尝试 relay-signaled `webrtc` 地址；
-3. 等待 ICE selected candidate pair；
-4. 执行完整 `direct_ready` 验证；
-5. 验证通过后才允许 MSFile 请求；
-6. 两种方式均失败则报告 Proxy 网络不可达。
-
-客户端可以根据近期成功记录调整地址尝试顺序，但不能降低验证条件。
-
-禁止只使用：
-
-```text
-dialProtocol(peer_id, "/msfile/1.0.0")
-```
-
-让 connection manager 任意复用现存连接，因为同一 PeerId 可能同时存在：
-
-- signaling Circuit Relay connection；
-- relay-signaled WebRTC connection；
-- WebRTC Direct connection。
-
-正确做法是：
-
-1. 对明确的 WebRTC multiaddr 建连；
-2. 取得建连返回的具体 libp2p Connection；
-3. 对该对象执行第 8 节检查；
-4. 在这个具体 Connection 上 `newStream("/msfile/1.0.0")`。
-
-连接断开后可以重新执行上述流程；绝不能把待重试 Read 自动切到 indirect connection。
-
----
-
-## 8. `direct_ready` 强制检查
-
-每次 connection 建立后，MSFile 网络层必须完成以下全部检查。
-
-### 8.1 libp2p Connection 检查
-
-```text
-connection.status == open
-connection.direct == true
-connection.limits == nil
-connection.remote_peer == expected_proxy_peer_id
-transport matches webrtc or webrtc-direct
-```
-
-说明：
-
-- `direct == false` 表示间接连接，不得用于 MSFile；
-- `limits != nil` 通常表示 Relay 施加字节或时间限制，不得用于 MSFile；
-- relay-signaled WebRTC 的 remote multiaddr 可能仍包含建立路径信息，不能仅凭字符串中出现
-  `p2p-circuit` 就判断文件仍经 Relay；必须结合 connection 类型和真实 ICE pair；
-- transport 必须明确是 WebRTC，TCP、WebSocket、WebTransport 和裸 Circuit Relay 均不
-  自动成为 MSFile V1 transport。
-
-### 8.2 身份检查
-
-```text
-remote_public_key.type == secp256k1
-remote_public_key == configured/whitelisted public key
-PeerId(remote_public_key) == connection.remote_peer
-```
-
-客户端检查 Proxy 身份；Proxy 对入站 connection 执行同样逻辑并检查客户端白名单。
-
-### 8.3 ICE selected candidate pair 检查
-
-实现必须从底层 `RTCPeerConnection` 或等价 Go/Pion ICE transport 取得当前 selected candidate
-pair。允许的 candidate type：
-
-```text
-host
-srflx
-prflx
-```
-
-以下任一条件均必须拒绝或立即关闭 MSFile connection：
-
-```text
-local_candidate_type  == relay
-remote_candidate_type == relay
-selected pair 不存在
-selected pair state 不是 succeeded/selected
-```
-
-Circuit Relay 和 ICE `relay` candidate 是两个不同概念：前者可以交换信令；后者通常表示
-TURN 数据中转，V1 禁止。
-
-如果 ICE restart 或网络切换改变 selected candidate pair，必须重新执行本节检查。在检查
-完成前暂停新 MSFile stream；新 pair 不合格时关闭现有 MSFile connection。
-
-### 8.4 js-libp2p 观测接口
-
-当前 js-libp2p 公共 `Connection` 可以提供 `direct`、`limits` 和 `remoteAddr`，但底层
-`RTCPeerConnection` 可能被 transport 封装为私有字段。实现必须通过以下一种受控方式取得
-ICE 观测值：
-
-- 上游公开的 transport event/hook；
-- 项目维护的最小 transport adapter；
-- 对固定依赖版本维护的最小补丁，输出只读 selected-pair snapshot。
-
-观测接口只能暴露候选类型、协议、必要的脱敏地址和统计，不得暴露私钥或允许插件操作
-RTCPeerConnection。不能因为库没有公开 `getStats()` 就跳过检查。
-
-### 8.5 MSFile stream gate
-
-出站和入站都必须执行：
-
-```text
-if connection is not direct_ready:
-    reject/reset /msfile/1.0.0 stream
-```
-
-MSFile 协议注册和开流禁止设置 `runOnLimitedConnection=true`。只有 libp2p 自己的 WebRTC
-signaling handler 可以在 limited connection 上显式运行。
-
----
-
-## 9. 可确认的 Relay 退出机制
-
-“Relay 不再参与数据传输”必须由以下四类证据共同确认。
-
-### 9.1 建连状态证据
-
-- signaling stream 已关闭；
-- `RTCPeerConnection.connectionState == connected`；
-- libp2p 已创建独立 WebRTC Connection；
-- MSFile 使用该具体 Connection 开流。
-
-### 9.2 路径证据
-
-- `connection.direct == true`；
-- `connection.limits == nil`；
-- selected candidate pair 不含 `relay`；
-- WebRTC candidate-pair `bytesSent/bytesReceived` 随 MSFile 传输增长。
-
-### 9.3 Relay 流量证据
-
-受控 Relay 应提供按 reservation/connection 的字节和存续统计。建立 WebRTC 后：
-
-- Relay 可以有 reservation keepalive 和小量控制流量；
-- Relay 字节不得随 Seed 或文件块体积同比增长；
-- 两端的 protocol metrics 不得显示在 Relay connection 上打开 MSFile stream；
-- Relay 本身看不到 Noise 内部协议明文，只能通过连接字节增量与端点侧 protocol metrics
-  交叉验证。
-
-### 9.4 断 Relay 证据
-
-集成测试必须在 WebRTC `direct_ready` 后停止或防火墙阻断 Relay，然后继续传输大量随机块。
-已经建立的 MSFile 读取必须继续成功。Relay 消失后不能建立新的 relay-signaled connection
-是正常结果，不影响当前直连证明。
-
-只看“文件还能下载”或只看 multiaddr 都不足以作为完整证据；运行时 gate 和断 Relay 测试
-必须同时存在。
-
----
-
-## 10. 连接状态机
-
-```text
-idle
+configured
   -> dialing
-  -> signaling             # 仅模式 B
-  -> ice_connecting
-  -> direct_verifying
-  -> direct_ready
+  -> authenticating
+  -> msfile_ready
   -> disconnected
 
 任意中间状态 -> failed
 ```
 
-只有 `direct_ready` 允许打开 `/msfile/1.0.0`。
+只有 `msfile_ready` connection 可以打开 `/msfile/1.0.0` stream。一个地址失败可以尝试同一
+供应商的另一允许 transport；这只是地址切换，不改变供应商身份。
 
-建议暴露给 Keymaster 诊断层的只读快照：
+如果同一供应商同时存在多个可用 connection，客户端应选择一个作为 active connection，避免
+同一身份下 request ID、Read 覆盖和预算状态被分散到多个 connection。
+
+---
+
+## 6. MSFile stream 生命周期
+
+### 6.1 建立
+
+客户端在 active connection 上：
+
+1. 打开第一条 `/msfile/1.0.0` stream；
+2. 以 StatRequest 作为首个 Frame，将它锁定为 Stat stream；
+3. 第一次需要内容时打开第二条 `/msfile/1.0.0` stream；
+4. 以 ReadRequest 作为首个 Frame，将它锁定为 Read stream；
+5. 后续请求复用相应 stream。
+
+供应商对同一 connection 上重复打开的同角色 stream 应拒绝或 Reset，避免产生多个序号作用域。
+stream 重建时必须先确认旧 stream 已终止，并延续当前 connection 的 request ID 计数。
+
+### 6.2 为什么使用两条 stream
+
+| 方案 | 优点 | 问题 | V1 结论 |
+|---|---|---|---|
+| 每个请求一条 stream | 天然关联和独立取消 | 高频 Stat 和 Read 会反复支付 stream 协商与状态开销 | 不采用 |
+| Stat/Read 混合一条 stream | stream 数最少 | Seed/块 attachment、背压和 Reset 会阻塞或影响 Stat | 不采用 |
+| 一条 Stat + 一条 Read | 控制面与数据面隔离，stream 数固定 | Read 内仍需 request ID 和串行 writer | **采用** |
+
+WebRTC transport 通常把 libp2p stream 映射为 RTCDataChannel；WSS 则通过 Yamux 维护 stream
+状态。具体内存和时延由实现版本决定，但两条长期复用 stream 避免了每次请求的协议协商和
+stream churn。正式实现仍需用目标浏览器、js-libp2p 和 go-libp2p 版本做基准测试。
+
+### 6.3 全双工与写入纪律
+
+- 请求读取循环、业务执行器和响应写队列应相互独立；
+- 供应商可以并发执行多个 Stat 或 Read；
+- 响应可以按完成顺序乱序返回；
+- 每个方向必须只有一个 Frame writer；
+- attachment 不得与其他响应交错；
+- Read stream Reset 不影响 Stat stream，但两者共享 connection 的带宽与关闭事件；
+- connection 关闭会同时终止两条 stream。
+
+---
+
+## 7. 多供应商调度
+
+### 7.1 Stat：对所有供应商并发
+
+查询某个 `seed_hash` 时，客户端必须对所有已启用供应商并发发送 Stat：
 
 ```text
-proxy_peer_id
-transport = webrtc | webrtc-direct
-state
-direct
-limited
-local_candidate_type
-remote_candidate_type
-candidate_protocol
-relay_peer_id              # 仅模式 B，说明其角色是 signaling_only
-rtt_ms
-connected_at
-last_error_code
+for supplier in enabled_suppliers concurrently:
+  connection = get_or_dial(supplier)
+  send StatRequest on supplier.stat_stream
 ```
 
-不得向普通 Connect App 暴露完整内网地址、STUN 映射地址或 Relay 管理细节。App 只需要知道
-Proxy 是否可用以及 MSFile 命令结果。
+聚合键是：
+
+```text
+(supplier_id, seed_hash, stat_request_id)
+```
+
+规则：
+
+- 每个响应的 `supplier_id` 来自承载它的 authenticated connection；
+- 不在 StatRequest 中携带供应商 ID；
+- 每个供应商独立维护状态与超时；
+- 某个供应商连接失败不阻塞其他供应商结果；
+- 网络失败不能转换为 `absent`；
+- App 频繁刷新 Stat 时复用既有 Stat stream；
+- 同一供应商、同一 SeedHash 只展示最大 `stat_request_id` 的响应。
+
+### 7.2 Read：按供应商公钥定向
+
+客户端根据 Stat 结果、价格、延迟和本地策略选定供应商，然后只在该供应商 authenticated
+connection 的 Read stream 上发送 Read：
+
+```text
+read(supplier_id, content_hash, max_price_satoshis)
+```
+
+`supplier_id` 是客户端 service API 的路由参数，不进入 ReadRequest。不同供应商之间的相同
+`content_hash` 和 request ID 不共享授权状态。
+
+Read 既用于取得 Seed，也用于取得 Seed 中列出的文件块。客户端不需要先发送 Acquire。
+
+### 7.3 播放与预读
+
+顺序播放可以维持一个有限的后台 Read 窗口。用户 seek 时：
+
+1. 停止继续扩展旧位置的预读窗口；
+2. 优先发送目标位置所需块的 Read；
+3. 必要时用同一 hash 的更大 `read_request_id` 更新价格上限；
+4. 内容到达后再按新位置恢复后台窗口。
+
+调度优先级由客户端发送策略表达，不增加 wire `priority` 字段。
 
 ---
 
-## 11. 多 Proxy 调度
+## 8. 背压与资源限制
 
-Keymaster 可以配置多个 Proxy，并对每个 Proxy 独立维护 connection 和状态。
+两种 transport 都提供可靠字节传输，但都必须显式执行背压：
 
-当系统需要某个 SeedHash 时：
+- 不把 16 MiB Seed、256 KiB 块或完整文件一次性复制到 transport buffer；
+- encoder 增量写入，decoder 增量读取并计算 SHA-256；
+- WSS 使用 Yamux/stream 的背压，不直接绕过 libp2p 调用 WebSocket `send()`；
+- WebRTC Direct 不直接绕过 libp2p 调用 RTCDataChannel `send()`；
+- 限制每公钥、每 connection 和全局未完成 Read 数；
+- 限制 response writer 队列总字节数；
+- 限制 Stat 频率，但允许 App 高频轮询复用同一 stream；
+- 资源不足时返回 `rate_limited`、Reset stream 或关闭 connection，不得静默丢包。
 
-1. 对所有配置 Proxy 并发或按本地策略建立/复用 `direct_ready` connection；
-2. 在每个可用 connection 的独立 stream 上发送 StatRequest；
-3. 连接失败与业务 `absent` 严格区分；
-4. 聚合 `available/quoted/discovering/absent`；
-5. 根据本地、报价、延迟、策略和用户选择决定使用哪个 Proxy；
-6. 后续 Acquire 和 Read 必须发送到产生该 quote/acquisition 的同一 Proxy 身份。
+建议分别观测：
 
-一个 Proxy 不可达不能伪装成 `absent`，也不应阻塞其他 Proxy 的 Stat 结果。
-
----
-
-## 12. 背压与资源控制
-
-WebRTC DataChannel 是可靠二进制传输，但仍必须执行背压和并发限制：
-
-- 使用 libp2p stream 写入 raw attachment；
-- 不直接把 16 MiB Seed、256 KiB 块或整个文件作为单个 `RTCDataChannel.send()` 消息；
-- MSFile encoder 按 WebRTC transport 的 `maxMessageSize` 主动拆成小块 write，V1 建议每片
-  不超过 16 KiB；
-- 为每个客户端公钥限制并发 Read stream；
-- 为每个 connection 限制未完成 attachment 总字节；
-- 为 Proxy 设置总带宽、内存和打开 stream 上限；
-- 浏览器 tab 暂停、网络切换和 ICE restart 后允许按块恢复；
-- 资源耗尽只能限流、拒绝或断开，不能回退 Relay。
-
-Relay-signaled 模式下 signaling connection 和 WebRTC data connection 必须分别计量，避免把
-控制流量误计为文件带宽。
+```text
+connections_by_transport
+open_stat_streams
+open_read_streams
+pending_stat_requests
+pending_read_requests
+response_queue_bytes
+content_bytes_sent
+stream_resets
+```
 
 ---
 
-## 13. 安全边界
+## 9. 安全边界
 
-### 13.1 网络机密性
+### 9.1 三层校验
 
-WebRTC DTLS 保护 DataChannel；libp2p secure handshake 认证 PeerId。实现不得因为 WebRTC
-已经加密而关闭 libp2p 身份认证。
+```text
+transport encryption  -> 防窃听和链路篡改
+libp2p identity       -> 认证客户端/供应商公钥
+content SHA-256       -> 验证 Seed 与文件块真值
+```
 
-### 13.2 内容完整性
+任何一层都不能替代另一层。特别是 WSS TLS 证书不能替代 supplier public key pin，WebRTC DTLS
+也不能替代内容哈希。
 
-网络加密不替代 MasterSeed 校验。客户端仍必须：
+### 9.2 白名单与预算
 
-- 验证 SeedHash；
-- 验证 Seed 与文件尺寸；
-- 验证每个块 SHA-256；
-- 校验成功后才交给上层。
+白名单公钥仍可能来自被盗设备或有 bug 的客户端。供应商必须保留：
 
-### 13.3 白名单不替代限流
+- connection、stream 和请求频率限制；
+- Read 单次价格上限检查；
+- 每公钥累计支出与速率策略；
+- Frame、attachment、内存和带宽上限；
+- 超时、异常序号和违规行为处理。
 
-白名单公钥也可能对应被盗设备或有 bug 的客户端。Proxy 必须保留：
+### 9.3 日志
 
-- connection 和 stream 数量上限；
-- Stat/Read 频率限制；
-- Acquire 预算限制；
-- Frame 和 attachment 尺寸限制；
-- 超时、取消和异常行为封禁策略。
-
-### 13.4 日志
-
-允许记录 PeerId 和截断/脱敏公钥用于审计。禁止记录：
+允许记录 PeerId、供应商 ID 的截断展示、transport、request ID、content hash 和尺寸用于审计。
+禁止记录：
 
 - 私钥；
-- 完整 Seed attachment；
-- 文件块内容；
-- acquisition identifier；
-- 用户内网地址的非必要长期历史；
-- SDP 全文和 ICE credential。
+- 完整内容 attachment；
+- 完整客户端白名单；
+- WebSocket/TLS credential；
+- 交易原文或钱包秘密；
+- 非必要的长期内网地址历史。
 
 ---
 
-## 14. 失败语义
+## 10. 失败语义与恢复
 
 网络层至少区分：
 
 ```text
-proxy_unreachable
-direct_dial_failed
-signaling_failed
-ice_failed
-direct_verification_failed
-unexpected_relay_path
+supplier_unreachable
+transport_not_supported
+webrtc_direct_dial_failed
+wss_dial_failed
+tls_validation_failed
 peer_id_mismatch
 public_key_not_allowed
 connection_closed
+stream_open_failed
 stream_reset
 timeout
 ```
 
-这些错误不是 Wire ErrorResponse，因为失败时可能尚未形成合法 MSFile stream。它们也不能
-转换成：
+这些错误发生在合法业务响应之外，不能转换成：
 
 ```text
 absent
 discovering
-unavailable
+content_not_found
 ```
 
-客户端可以对另一个地址或另一个 Proxy 重试；对同一 Proxy 的 Acquire 不确定结果必须遵守
-Wire Protocol 的 `idempotency_key` 规则。
+恢复规则：
+
+- Stat stream 失败：重建 stream，继续 connection 级 Stat 序号；
+- Read stream 失败：所有未终结 Read 进入传输不确定状态，重建后由客户端重新决策；
+- connection 失败：关闭两条 stream，按供应商地址策略重拨；
+- 重拨到同一公钥的另一 transport 仍是同一供应商，但形成新的 request ID 作用域；
+- 供应商不得因客户端断线开始新的付款；已经不可逆的付款按 Wire Protocol 边界处理；
+- 对其他供应商的 Stat 和 Read 不受单个供应商故障影响。
 
 ---
 
-## 15. 兼容性与版本
+## 11. 兼容性与版本
 
 MSFile protocol ID 固定为：
 
@@ -601,93 +459,79 @@ MSFile protocol ID 固定为：
 /msfile/1.0.0
 ```
 
-libp2p、js-libp2p、go-libp2p、Pion、WebRTC Direct 内部规范和浏览器实现具有独立版本。实现
-必须维护经过测试的兼容矩阵，尤其覆盖 WebRTC Direct V1/V2 演进和浏览器 ICE 行为变化。
+libp2p、Noise、Yamux、WebRTC Direct、WebSocket 和浏览器都有独立版本。依赖升级后，只要以下
+可观察结果不变，就不提升 MSFile wire 版本：
 
-升级依赖后，只要以下可观察结果不变，就不提升 MSFile wire 版本：
+- 同一业务公钥仍认证为同一供应商身份；
+- 两种允许 transport 都提供可靠、双向 libp2p stream；
+- Stat/Read 双 stream 角色和生命周期不变；
+- `/msfile/1.0.0` Frame 字节与命令语义不变。
 
-- 相同业务私钥派生并认证相同 PeerId；
-- 两种 WebRTC 模式语义不变；
-- Relay 仍只承担信令；
-- `direct_ready` 检查仍成立；
-- `/msfile/1.0.0` Frame 字节和命令语义不变。
-
-任何让 MSFile 可以运行在 Relay、TURN 或其他 transport 上的变化都不是兼容实现优化，必须
-重新设计并提升协议版本。
+新增 transport 不等于自动获得 MSFile 兼容性；必须先完成安全、互操作和性能验收。改变 Frame、
+Kind、数组字段或请求覆盖规则必须提升 MSFile 版本。
 
 ---
 
-## 16. 验收范围
+## 12. 验收范围
 
-### 16.1 身份
+### 12.1 身份
 
-- Go 与 Browser 使用同一 32 字节 secp256k1 私钥得到一致业务公钥和 PeerId；
-- Proxy 从 connection 取得的远端公钥与客户端业务公钥一致；
-- 非白名单公钥无法打开 MSFile stream；
-- 伪造报文字段无法替代连接身份；
-- Vault 锁定和 active key 切换立即关闭旧身份连接。
+- JS 与 Go 从同一 secp256k1 私钥派生一致公钥和 PeerId；
+- 两端从 authenticated connection 取得正确远端公钥；
+- 错误 PeerId、公钥 pin 或白名单连接失败；
+- 伪造 Frame 字段不能改变供应商或客户端身份；
+- Vault 锁定和 active key 切换关闭旧身份 connection。
 
-### 16.2 WebRTC Direct
+### 12.2 WebRTC Direct
 
-- Chrome、Firefox、Safari 拨入 Go Proxy；
-- 公网 IPv6、IPv4 和路由端口映射；
-- certhash 持久化与轮换；
-- 错误 PeerId、错误 certhash 和过期地址失败关闭；
-- 不启动 Circuit Relay 时仍能完成大文件随机块读取。
+- Chrome、Firefox、Safari 拨入兼容供应商；
+- 公网 IPv6、IPv4 和稳定 UDP 映射场景；
+- 正确与错误 certhash；
+- 认证后打开 Stat/Read stream；
+- 大 Seed、顺序块和随机块传输哈希一致；
+- 连接中断后可以重新拨号恢复。
 
-### 16.3 Relay-signaled WebRTC
+### 12.3 WSS
 
-- 常见家庭 NAT 下通过 STUN/ICE 形成直连；
-- signaling 完成后关闭 signaling stream；
-- `connection.direct == true` 且 `limits == nil`；
-- selected candidate pair 是 host/srflx/prflx；
-- ICE 失败时不产生 MSFile Relay fallback；
-- TURN URL 和 relay candidate 被拒绝；
-- 网络切换或 ICE restart 后重新验证 candidate pair。
+- Chrome、Firefox、Safari 通过受信 TLS 域名拨入供应商；
+- WSS 反向代理透明承载 libp2p；
+- Noise 认证和供应商公钥 pin 成功；
+- TLS 域名错误、证书错误和 PeerId 错误均失败关闭；
+- Yamux 下双 stream、乱序响应、背压和大 attachment 正常；
+- 本机 WS 仅在开发策略启用时可用。
 
-### 16.4 Relay 退出证明
+### 12.4 Stream 与调度
 
-- `direct_ready` 后停止 Relay，持续读取至少 1 GiB 随机块；
-- Relay 字节不随文件体积增长；
-- WebRTC candidate-pair bytes 与文件传输量同步增长；
-- 人为尝试在 limited/indirect connection 打开 `/msfile/1.0.0` 被拒绝；
-- 同一 PeerId 同时存在 Relay 与 WebRTC connection 时，MSFile 只选择具体 WebRTC
-  connection。
-
-### 16.5 性能与恢复
-
-- 256 KiB 块顺序读取和随机 seek；
-- 多 stream 并发与背压；
-- 16 MiB Seed 不发生 Base64 膨胀；
-- tab 暂停、connection 断开和按块恢复；
-- 大文件传输期间内存有明确上限；
-- Relay 不承担视频或文件带宽。
+- 每个 active connection 只有一条 Stat 和一条 Read stream；
+- Stat 向所有已启用供应商并发发送；
+- Read 只发送给选定供应商公钥；
+- 高频 Stat 不创建等量 stream；
+- Read attachment 不阻塞 StatResponse；
+- Read 内并发执行、乱序响应和覆盖取消符合 Wire Protocol；
+- 4/8 个并发内容请求时 Frame 不串线、内存有明确上限。
 
 ---
 
-## 17. 明确不属于 V1 的网络能力
+## 13. 明确不属于 V1 的网络能力
 
 V1 不定义：
 
-- TURN 数据中转；
-- Circuit Relay 文件回退；
-- HTTP/HTTPS、WebSocket/WSS 或 WebTransport 文件 API；
-- API Key、Bearer Token 或 Cookie 认证；
-- 匿名访问；
-- 浏览器作为 WebRTC Direct listener；
+- relay-signaled WebRTC、Circuit Relay 或 TURN 数据路径；
+- HTTP/HTTPS 文件 API 或裸 WebSocket 协议；
+- WebTransport、QUIC、TCP 等其他 MSFile transport；
+- API Key、Cookie、Bearer Token 或匿名访问；
+- MSFile 应用层重复握手和逐报文签名；
 - DHT、mDNS、Rendezvous、二维码或配对码的具体发现协议；
-- 自动修改家庭路由器的标准实现；
-- 对所有 CGNAT/企业网络保证可达；
-- 向 Connect App 暴露 raw libp2p host 或 RTCPeerConnection。
+- 自动修改家庭路由器或保证所有 NAT 环境可达；
+- 向 Connect App 暴露 raw libp2p host、RTCDataChannel 或 WebSocket。
 
 ---
 
 ## 参考规范与实现
 
 - [libp2p WebRTC Transport](https://github.com/libp2p/js-libp2p/tree/main/packages/transport-webrtc)
-- [libp2p WebRTC Protocol](https://github.com/libp2p/specs/blob/master/webrtc/webrtc.md)
 - [libp2p WebRTC Direct Protocol](https://github.com/libp2p/specs/blob/master/webrtc/webrtc-direct.md)
-- [libp2p Circuit Relay v2](https://github.com/libp2p/specs/tree/master/relay/circuit-v2)
-- [libp2p Connection Interface](https://github.com/libp2p/js-libp2p/blob/main/packages/interface/src/connection.ts)
-- [W3C WebRTC](https://www.w3.org/TR/webrtc/)
-- [W3C WebRTC Stats](https://www.w3.org/TR/webrtc-stats/)
+- [libp2p WebSockets Transport](https://github.com/libp2p/js-libp2p/tree/main/packages/transport-websockets)
+- [libp2p Noise](https://github.com/libp2p/specs/tree/master/noise)
+- [libp2p Yamux](https://github.com/libp2p/specs/tree/master/yamux)
+- [libp2p Connections and Streams](https://github.com/libp2p/specs/blob/master/connections/README.md)

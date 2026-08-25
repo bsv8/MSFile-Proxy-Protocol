@@ -1,172 +1,253 @@
-# libp2p WebRTC 与同钥身份互通实验报告
+# libp2p WebRTC Direct / WSS 与同钥身份互通实验报告
+
+> 协议范围裁决日期：2026-08-25。
+>
+> 本报告记录实验事实和后续验收矩阵。MSFile V1 已锁定为 libp2p WebRTC Direct 与
+> WebSocket/WSS 两种直连 transport；早期 relay-signaled WebRTC、Circuit Relay 和相关
+> candidate gate 实验不再是 V1 交付条件。
 
 施工单：[20260824-1](../../施工单/20260824/1-libp2p-webrtc与同钥身份互通实验施工单.md)
-状态：**本地原型基本完成，四轮评审的代码级问题已全部落地修复并复验：
-Private approval 时序竞态、Go 全量 race 稳定性、ICE 歧义检测窗口、
-live-counter 测试假通过窗口均已按评审建议修正并通过专项验证（待复核确认）。
-真实网络 E2E（T02–T07、T09、T14）、Git 版本跟踪与 Go 普通 NAT NAS 能力仍未完成**
-——NAS 能力需产品侧按 §3 三选一决策；E2E 需部署 HTTPS/WSS/公网 UDP 环境；
-交付需将 `labs/`、`docs/labs/` 加入版本控制。
 
 ---
 
-## 1. Gate 0：版本审计（2026-08-24）
+## 1. 当前裁决
 
-| 组件 | 锁定版本 | 备注 |
-|---|---|---|
-| Node.js | v22.13.1 | |
-| pnpm | 11.5.1 | |
-| libp2p (js) | **3.3.9** | npm latest；v3 起完全模块化，noise/yamux/identify/ping 显式装配 |
-| @libp2p/webrtc | **6.0.30** | 同时导出 `webRTC()` 与 `webRTCDirect()` ✓ |
-| @libp2p/crypto | **5.1.23** | `privateKeyFromRaw(32B)` → secp256k1 |
-| @libp2p/circuit-relay-v2 | **4.2.12** | `circuitRelayTransport` / `circuitRelayServer` |
-| @libp2p/peer-id | **6.0.15** | `peerIdFromPrivateKey` / `peerIdFromPublicKey` |
-| @noble/hashes | 2.x | `@noble/hashes/sha2.js` 增量 SHA-256 |
-| Go | go1.26.0 | go.mod 声明 >= 1.25 |
-| go-libp2p | **v0.49.0**（2026-07-28 release） | 非 main 分支依赖 ✓ |
-| Pion/WebRTC | 由 go.sum 解析（v0.49.0 内已升级） | |
-| Chrome/Firefox/Safari | 待实验执行时填写 | |
+实验与协议讨论已经确认：
 
-### Gate 0 五项确认结论
+1. 保留 libp2p，不在裸 RTCDataChannel 或裸 WebSocket 上重新实现认证与 stream；
+2. 支持 `webRTCDirect()` 和 `webSockets()`；
+3. 生产浏览器 WebSocket 路径使用 WSS，WS 仅用于本机或受控开发环境；
+4. 删除 relay-signaled `webRTC()`、Circuit Relay 和 TURN 相关产品路径；
+5. 业务 identity 使用同一把 secp256k1 私钥；
+6. 供应商 ID 是 libp2p connection 已认证出的 33 字节压缩公钥；
+7. libp2p 已负责 Noise 身份认证，MSFile 不增加应用层握手；
+8. 每个供应商 connection 使用一条长驻 Stat stream 和一条按需长驻 Read stream；
+9. Stat 向所有启用供应商并发，Read 按供应商公钥定向；
+10. 一条 stream 内允许多个并发请求和乱序响应，Frame 写入仍必须串行。
 
-1. **js-libp2p 是否仍支持 `webRTC()` 和 `webRTCDirect()`**：是。`@libp2p/webrtc@6.0.30`
-   同时导出两个 transport；官方 README 示例给出 Browser↔Browser relay-signaled 全流程。
-2. **Go WebRTC transport 是否仍只实现 WebRTC Direct**：是。
-   `p2p/transport/webrtc.Transport.Protocols()` 仅返回 `[P_WEBRTC_DIRECT]`
-   （v0.49.0 源码确认）。上游能力矩阵维持 `WebRTC Direct = supported / WebRTC = not supported`。
-3. **Go host 能否监听 relay-signaled `/webrtc`**：不能。运行时探针
-   （`internal/nas.ProbePrivateWebRTCListener`，对 `/ip4/127.0.0.1/udp/0/webrtc` 发起
-   Listen）稳定失败 → nas 启动时输出
-   `webrtc_private_listener = unsupported` + `UNSUPPORTED_UPSTREAM`。
-   按施工单 §3.2：不自行实现 Go private WebRTC transport、不改上游源码、不把 Circuit Relay
-   connection 当数据连接。
-4. **WebRTC Direct V2 Browser -> Go 是否进入正式 release**：是。go-libp2p v0.49.0 包含
-   `feat(webrtc): support webrtc-direct v2`（PR #3520）。
-5. **js-libp2p 是否公开 selected ICE candidate pair 观测接口**：否。
-   `@libp2p/webrtc@6.0.30` 未暴露底层 RTCPeerConnection/getStats。
-   处置（§6.6 允许的最小只读 observer）：页面在创建节点前包装
-   `window.RTCPeerConnection` 构造器，仅登记实例并周期采样 `getStats()` 提取 selected pair，
-   不改变拨号/ICE/DataChannel 行为；实现位于
-   `labs/webrtc-web/src/stats.ts#installPeerConnectionObserver`，随源码提交并有本节说明。
+协议真值见：
 
-### 附加上游发现
+- [MSFile Proxy Network Protocol v1](../protocol/network.zh.md)
+- [MSFile Proxy Wire Messages v1](../protocol/wire-messages.zh.md)
 
-- v0.49.0 起 Go WebRTC Direct 的 DTLS 证书由 identity 私钥 HKDF 确定性派生
-  （`feat(webrtc): stable /certhash across restarts`, PR #3512）→ 同一 test identity 重启后
-  certhash 稳定，满足 §7.2 证书持久化要求，无需额外持久化层。
+---
 
-## 2. 固定跨语言 identity vector（T01）
+## 2. 版本审计基线（2026-08-24）
 
-`labs/*/testdata/identity-vector.json`：
+| 组件 | 实验锁定版本 | 与当前 V1 的关系 |
+|---|---:|---|
+| Node.js | v22.13.1 | JS 实验运行时 |
+| pnpm | 11.5.1 | JS 包管理器 |
+| libp2p (js) | 3.3.9 | 显式装配 transport、Noise、Yamux 和服务 |
+| `@libp2p/webrtc` | 6.0.30 | V1 只使用 `webRTCDirect()` |
+| `@libp2p/websockets` | 10.1.20 | V1 使用 `webSockets()`；生产地址为 WSS |
+| `@libp2p/crypto` | 5.1.23 | 从 32 字节 secp256k1 私钥派生 identity |
+| `@libp2p/peer-id` | 6.0.15 | 公钥与 PeerId 互相校验 |
+| `@noble/hashes` | 2.x | 增量 SHA-256 |
+| Go | go1.26.0 | Go 实验运行时；`go.mod` 声明 >= 1.25 |
+| go-libp2p | v0.49.0 | WebRTC Direct 与 Go identity 基线 |
+| Pion/WebRTC | 由 `go.sum` 锁定 | Go WebRTC Direct 底层实现 |
+
+版本号是本次实验的可复现基线，不是 MSFile wire 的组成部分。依赖升级必须重新执行本文矩阵，
+但只要可观察身份、stream 和 Frame 语义不变，就不改变 `/msfile/1.0.0`。
+
+### 2.1 上游能力结论
+
+- js-libp2p 同时提供 WebRTC 与 WebRTC Direct；当前 V1 只选择 WebRTC Direct；
+- WebRTC Direct 使用可靠 DataChannel 承载 libp2p protocol stream；
+- WebRTC Direct 在身份认证成功后使用 WebRTC 自带的 DataChannel multiplexing；
+- WebSocket transport 可以与 Noise、Yamux 组合，浏览器可以作为 WSS dialer；
+- go-libp2p v0.49.0 的 WebRTC transport 支持 WebRTC Direct；
+- go-libp2p 是否由目标部署程序直接提供 WSS listener，仍需在新的 WSS 实验中验收，不能用
+  “JS 已安装 `@libp2p/websockets`”代替跨语言证据。
+
+---
+
+## 3. 固定跨语言 identity vector
+
+两侧共享测试向量位于 `labs/*/testdata/identity-vector.json`：
 
 ```text
-private_key_hex : 278d5bed18a82b66619e026c2efb2a907e35310829d9658fb967180636afaa6a   # test-only，无资金无权限
-public_key_hex  : 02e940822d4e7a09ce013bed4fa812e92f22b0ed1fa2d1ad06ae0406680da1cc46 # 33B compressed
-peer_id         : 16Uiu2HAmB8C2R7pBJu1z2u1gno7aXcbtkoUzrknTFN2EBLjRavKP              # secp256k1 前缀
+private_key_hex : 278d5bed18a82b66619e026c2efb2a907e35310829d9658fb967180636afaa6a
+public_key_hex  : 02e940822d4e7a09ce013bed4fa812e92f22b0ed1fa2d1ad06ae0406680da1cc46
+peer_id         : 16Uiu2HAmB8C2R7pBJu1z2u1gno7aXcbtkoUzrknTFN2EBLjRavKP
 ```
 
-- Go（go-libp2p v0.49.0）与 TypeScript（@libp2p/crypto 5.1.23）各自独立从
-  `private_key_hex` 派生并比对期望值，两侧单测均 PASS：
-  - `labs/webrtc-go/identity_vector_test.go#TestFixedIdentityVectorDerivation`
-  - `labs/webrtc-web/test/identity-vector.test.ts` "fixed identity vector (T01)"
-- 确定性 payload 的跨语言 digest fixture（total=1000/seed=77、65537/42、262144/7）
-  在两侧测试中同时断言相等。
+该私钥只用于测试，无资金和生产权限。
 
-## 3. 实验矩阵 T01–T14
+已验证：
 
-> 执行环境要求：NAS 公网可达 UDP、Relay WSS 反代（公共信任链 TLS）、双浏览器 profile。
-> 每项必须附版本、JSONL 日志、连接路径与字节统计证据后方可标记 PASS。
+- Go 与 TypeScript 分别从相同 32 字节私钥派生相同 33 字节压缩公钥；
+- 两侧派生相同 PeerId；
+- 固定 payload 的跨语言 SHA-256 fixture 一致；
+- 这证明 `supplier_id = authenticated public key` 与 PeerId 派生可以跨语言稳定实现。
 
-| ID | 场景 | 结果 | 证据（待回填） |
+对应测试：
+
+- `labs/webrtc-go/identity_vector_test.go#TestFixedIdentityVectorDerivation`
+- `labs/webrtc-web/test/identity-vector.test.ts`
+
+---
+
+## 4. 当前原型与新协议的差距
+
+现有 `labs/webrtc-*` 是协议裁决前的研究原型。它已经包含 WebRTC Direct、WebSocket transport
+依赖、identity、字节流 framing、白名单和大流量测试基础，但源码仍保留：
+
+- `webRTC()` relay-signaled transport；
+- Circuit Relay client/server；
+- Relay 流量计数与退出证明；
+- TURN/candidate 类型 gate；
+- 旧的“一次实验一条 stream”协议 handler。
+
+这些代码没有在本次文档任务中删除，因为当前任务只落地协议文档。它们不能再作为 MSFile V1
+运行路径或验收要求。进入正式实现前应另开代码任务：
+
+1. 从默认节点装配和 UI 删除 relay-signaled 路径；
+2. 增加真实 WSS listener/反向代理实验；
+3. 把 lab protocol 改为长驻 Stat/Read 双 stream；
+4. 增加 request ID、乱序响应、ReadCancelled 和 raw attachment 测试。
+
+---
+
+## 5. 已有实验结果
+
+截至 2026-08-24 的本地记录：
+
+```text
+labs/webrtc-web:
+  pnpm install --frozen-lockfile     PASS
+  pnpm test                          57 passed
+  pnpm build                         PASS
+
+labs/webrtc-go:
+  go vet ./...                       PASS
+  gofmt                              no diff
+  go test ./...                      PASS
+  go test -race -count=1 ./...       PASS
+  go build ./cmd/msfile-webrtc-lab   PASS
+```
+
+这些结果证明实验基础代码在当时版本下可构建，并不等于新的 MSFile wire 已实现。现有专项测试中
+仍有一部分只服务于已经退出 V1 的 Relay/candidate 研究，后续不纳入回归门槛。
+
+### 5.1 可以保留的工程结论
+
+- `crypto.getRandomValues` 单次 64 KiB 上限需要分段处理；
+- 大内容必须边生成、边哈希、边发送，不能预先分配完整 1 GiB payload；
+- 浏览器主线程上的重计算应移入 Worker，并使用 credit/transferable 控制背压；
+- Frame 解析必须支持任意碎片化，不能假设一次 read 得到完整 Header；
+- 大流量测试必须采样传输期间峰值内存，不能只比较开始和结束快照；
+- listener 必须在 protocol handler 内再次检查 authenticated connection 的远端公钥；
+- 每条 stream 的 sink 必须由单一 writer 驱动，避免 Frame 字节交错。
+
+---
+
+## 6. 新互操作验收矩阵
+
+以下矩阵替代旧 T01–T14，结果必须附浏览器/依赖版本、JSONL 日志、multiaddr、远端公钥、
+transport、摘要和资源快照。
+
+| ID | 场景 | 当前状态 | 通过条件 |
 |---|---|---|---|
-| T01 | JS/Go 固定私钥派生公钥与 PeerId 一致 | **PASS**（单元级） | 上文 §2 测试名 |
-| T02 | Browser -> Go NAS WebRTC Direct identity | 待执行 | |
-| T03 | Browser -> Go NAS WebRTC Direct echo | 待执行 | |
-| T04 | Browser <- Go NAS WebRTC Direct 1 GiB bytes | 待执行 | |
-| T05 | Browser A -> Browser B relay-signaled WebRTC | 待执行 | |
-| T06 | T05 后 Relay 在线传 256 MiB，Relay 字节不随 payload 增长 | 待执行 | relay edge proxy 计数 + candidate-pair bytes 快照 |
-| T07 | T05 后停止 Relay，同一 connection 再传 1 GiB | 待执行 | SIGTERM 时间戳 + 传输成功摘要 |
-| T08 | Browser -> Go NAS relay-signaled WebRTC | **UNSUPPORTED_UPSTREAM**（Gate 0 探针证据） | §1 结论 3；nas `--relay-listen` 输出 |
-| T09 | ICE 打洞失败不得退回 Relay 数据传输 | 待执行 | |
-| T10 | 配置 TURN URL 必须启动前拒绝 | **PASS**（单元级） | `test/gates.test.ts` TURN hard rejection |
-| T11 | selected pair 出现 relay candidate 必须阻止 lab bytes | **PASS**（单元级） | `test/gates.test.ts` candidate type gate |
-| T12 | 非白名单 Browser -> Go NAS lab protocol 拒绝 | **PASS**（loopback 单元级） | `labproto_test.go#TestNonWhitelistedClientIsDenied` |
-| T13 | 错误 NAS PeerId/公钥 pin 建连或 gate 失败 | **PASS**（单元级） | `test/gates.test.ts` direct gate |
-| T14 | 4/8 并发 bytes stream 不串流、摘要正确、内存有界 | 待执行 | |
+| I01 | JS/Go 固定 identity vector | **PASS** | 私钥派生公钥与 PeerId 完全一致 |
+| I02 | Browser -> Go WebRTC Direct 身份认证 | 待执行 | 两端取得预期 authenticated remote public key |
+| I03 | WebRTC Direct 双向 protocol stream | 待执行 | 同一 stream 同时收发，half-close/Reset 行为明确 |
+| I04 | WebRTC Direct 大内容 | 待执行 | 16 MiB Seed、1 GiB 流摘要正确且内存有界 |
+| I05 | Browser -> Supplier WSS 身份认证 | 待执行 | 公共信任 TLS + Noise + supplier public key pin 全部通过 |
+| I06 | WSS/Yamux 双向 protocol stream | 待执行 | Stat/Read 两条 stream 独立、双向收发正常 |
+| I07 | WSS 大内容与背压 | 待执行 | 16 MiB Seed、1 GiB 流摘要正确且队列/内存有界 |
+| I08 | 同一供应商双 transport | 待执行 | WebRTC Direct/WSS 认证为同一公钥，地址切换不改变 supplier_id |
+| I09 | 长驻 Stat stream | 待实现 | 高频、多 hash、乱序响应，不重复建 stream |
+| I10 | 长驻 Read stream | 待实现 | 多 hash 并发，ReadResponse 按 request ID 正确关联 |
+| I11 | Read 授权覆盖 | 待实现 | 更大 ID 覆盖旧上限，旧请求收到 ReadCancelled |
+| I12 | ReadResponse 发送竞态 | 待实现 | 已开始 attachment 不截断，新请求不重复购买 |
+| I13 | Stat/Read 隔离 | 待实现 | Read 大 attachment 期间 StatResponse 仍可及时返回 |
+| I14 | 4/8 并发与恢复 | 待实现 | Frame 不串线、哈希正确、stream Reset 后可重建 |
+| I15 | 非白名单与错误 pin | 部分 PASS | 两种 transport 都必须拒绝，不能只覆盖 loopback |
 
-T08 为 UNSUPPORTED_UPSTREAM 时本次研究施工可完成，但“Go NAS 支持 relay-signaled
-WebRTC”的产品目标保持阻塞状态——**对“普通个人 NAS”是硬阻断**：普通 NAT 后、没有公网
-UDP/端口映射的 Go NAS 无法用当前方案对外提供服务。Browser ↔ Browser `webRTC()` 只能证明
-js-libp2p 路径，不能证明 Go NAS 路径。产品侧必须三选一：
+### 6.1 WebRTC Direct 实验环境
 
-1. v1 明确要求 Go NAS 具备公网 IPv6 或 IPv4/UDP 端口映射（WebRTC Direct 可用）；
-2. 另开项目补齐/向上游贡献 Go relay-signaled WebRTC transport；
-3. 引入支持该能力的 sidecar/runtime 承载 NAS 角色。
+- 公网可达 UDP 或稳定端口映射；
+- Chrome、Firefox、Safari 当前稳定版；
+- 固定供应商 identity、公钥与 `/certhash`；
+- 错误 PeerId、错误 certhash、连接中断和重拨反向用例。
 
-## 4. 构建与测试现状（2026-08-24，首轮评审修复后）
+### 6.2 WSS 实验环境
+
+- 公共信任链 TLS 证书和匹配域名；
+- 443/TCP 反向代理或供应商直接 TLS listener；
+- 透明二进制 WebSocket 转发；
+- Noise 与 Yamux 明确启用；
+- 错误域名、过期证书、错误 PeerId 和错误公钥 pin 反向用例；
+- WS 只在 loopback 测试，不把结果当作生产 WSS 证据。
+
+---
+
+## 7. Stream 性能基准
+
+V1 选择固定两条长驻 stream，而不是每个请求新建 stream。需要分别在 WebRTC Direct 与 WSS
+测量：
 
 ```text
-labs/webrtc-web: pnpm install --frozen-lockfile ✓ / pnpm test 57 passed ✓ / pnpm build ✓
-labs/webrtc-go : go vet ./... ✓ / gofmt 无 diff ✓
-                 go test ./... 全部通过（含 loopback 真实连接 E2E、relay 计数、SIGUSR1 行为）
-                 go test -race -count=1 ./... 通过 ✓
-                 go test -race -count=50 -run '^TestEdgeProxyCountersAreLiveDuringTransfer$' 通过 ✓
-                 go build ./cmd/msfile-webrtc-lab ✓
+connection_setup_ms
+stream_open_ms
+first_frame_ms
+stat_rtt_ms
+read_ttfb_ms
+read_throughput_bytes_per_second
+open_stream_memory_bytes
+pending_request_memory_bytes
+response_queue_peak_bytes
 ```
 
-### 第二轮评审阻断修复记录（2026-08-24）
+基准场景：
 
-| # | 阻断问题 | 修复 |
-|---|---|---|
-| 1 | listener 流程把 66 位压缩公钥传给 `deriveIdentity()`（仅接受 64 位私钥）导致等待连接前必报错 | 改用 `peerIdFromCompressedPublicKeyHex()`；新增 `test/listener-flow.test.ts` 覆盖 UI 公钥 → PeerId 派生 → `waitForApprovedInboundConnection` 的成功/无关 peer 超时/pre-check 失败路径 |
-| 2 | gate 在等待 ICE 采样之前执行（dial 函数内部提前 gate），连接过快时误报 `no selected ICE candidate pair` | 拆分拨号与 gate：记录 generation → 仅 dial → 等待本次新建 PC 的 selected pair → 只执行一次 `evaluateDirectGate`；日志与 UI 均使用最终 gate 结果 |
-| 3 | bytes 前 re-gate 未 await 采样、从全局最新 PC 取结果、按输入框猜测期望公钥 | 引入 `activeContext{connection, expectedPublicKeyHex, pcGeneration}`；`reGateActiveConn()` 异步等待指定 generation 的采样后用存储的上下文重新 gate |
-| SIG | SIGUSR1 被放进终止 Context，实测直接导致 relay_stopping/stopped | SIGINT/SIGTERM 单独负责终止；SIGUSR1 独立 channel，主循环只触发 `relay_counter_snapshot(trigger=SIGUSR1)`；新增 helper-process 测试断言“SIGUSR1 后进程仍在运行、SIGTERM 才退出” |
+1. 每请求新建 stream，作为开销对照；
+2. 一条长驻 Stat stream，连续 10,000 次查询；
+3. 一条长驻 Read stream，4/8 个并发 hash；
+4. 同一 hash 连续提高和降低 `max_price_satoshis`；
+5. 16 MiB Seed attachment 发送期间并发 Stat；
+6. stream Reset 后在原 connection 上重建；
+7. connection 断开后从 WebRTC Direct 切换到同供应商 WSS。
 
-ICE 证据加强：gate 直接复用 `isPairAllowedForTransfer()`，candidate type 仅接受
-host/srflx/prflx，`unknown` 一律失败；`samplePair` 优先读取浏览器
-`transport.selectedCandidatePairId`，缺失时才回退 succeeded/nominated 评分。
-峰值内存改为传输期间 250ms 间隔采样的 `PeakHeapSampler`（peak − baseline），
-替代起止差值。
+验收重点不是追求固定常数，而是证明：两条长驻 stream 的内存稳定、没有随请求次数增长，且
+控制面不会被数据 attachment 阻塞。
 
-### 第三轮评审阻断修复记录（2026-08-24）
+---
 
-| # | 问题 | 修复 |
-|---|---|---|
-| 1 | Dialer 在 Listener 完成审批前就发 identity，未批准流被立即 abort | `serveIfApproved` 对“预期 dialer 公钥对应的连接”引入有界等待（默认 30s，可配）：先发 `lab_protocol_pending_approval`，轮询 approved set，超时才 abort；无关 peer 仍立即拒绝。listener 流程在等待前通过 `approvals.setExpectedPeerId()` 注册预期。新增 `test/approval-race.test.ts` 覆盖“identity 先到、approval 后到”及超时/立即拒绝路径 |
-| 2 | Relay 计数测试在首次读取后立即断言，`-race -count=20` 失败 2/20 | 第四轮重构为严格形式：独立 goroutine 持续读取（atomic readTotal），主测试 10ms ticker 轮询计数，仅在 `0 < readTotal < totalBytes` 时接受 `out>0`（并断言 in==0、active==1）；若 reader 完成前从未观察到实时计数则 Fatal——消除完整读取后的假通过路径。首次观察到 partial read 后启动 500ms 有界等待窗口，窗口内 out==0 继续轮询、超时才 Fatal；readerDone 先于任何中途计数仍 Fatal。并发 shutdown 测试 `TestEdgeProxyShutdownWaitsForActiveConnsAndCountsRaceSafe` 已恢复（4 连接并发 + 并发 snapshot 轮询 + `waitForCounter` 同步 + stop 后 active==0）。验证：live-counter 与 shutdown 各自 `-race -count=100` 专项通过；`-race -count=20 ./...` 通过 |
-| 3 | ICE 歧义检测只统计“已产生 pair”的新 PC：第二个 PC 已创建但尚未采样时仍会误绑 | `waitForSelectedPair()` 改为统计 marker 后**所有未关闭**新 PeerConnection，数量 >1 即抛出 `ambiguous ICE evidence`（标注各有无 pair）；新增 `test/ice-binding.test.ts` 覆盖“两个新 PC 只有一个已有 pair”“单 PC 正常解析”“closed PC 不计入”三个用例。connection.id→PC 精确映射留作长期改进 |
+## 8. 已退出的旧实验项
 
-其他：`ApprovalRegistry.clear()` 现同时重置 expectedPeerId，避免节点重启或角色切换后保留旧预期白名单。
+以下旧项目只保留在 Git 历史或原型代码中，不再进入 MSFile V1 验收矩阵：
 
-### Git 交付状态
+- Browser A/B relay-signaled WebRTC；
+- Go relay-signaled WebRTC listener 探针；
+- Circuit Relay reservation 和流量计数；
+- 停止 Relay 后继续传输的证明；
+- TURN URL 与 relay ICE candidate gate；
+- “Relay 只做信令、不承载文件”的运行时检查。
 
-`labs/`、`docs/labs/` 尚未加入 Git 跟踪（本地实验不受影响）。正式提交与交付前
-需要用户确认后执行 `git add` 与提交操作。
+退出原因不是实验失败，而是产品网络模型已经改为 WebRTC Direct + WSS 两种显式直连 transport。
+因此不再需要维护第三种建连、信令退出或 Relay 数据边界。
 
-### 首轮评审阻断修复记录（2026-08-24）
+---
 
-| # | 阻断问题 | 修复 |
-|---|---|---|
-| 1 | 256 KiB echo 因 `crypto.getRandomValues` 64 KiB 单次上限失败 | `identity.ts#fillRandom` 分段填充；单测覆盖 >64 KiB 尺寸 |
-| 2 | 1 GiB 传输：32B/次异步 send + 发送前全量预计算摘要 | 生成聚合为 ≤16 KiB 批次；framing 改为“8B 头 + payload + 32B SHA-256 trailer”，边生成边哈希边发送，无预遍历；浏览器侧重活移入 Web Worker（credit 背压 + transferable）；数据仍为 SHA256(seed‖counter) 确定性流，跨语言 fixture 不变 |
-| 3 | ICE candidate 证据未绑定具体连接、采样延迟误判 | observer 引入 generation；拨号前记录 generation，拨号后 `waitForSelectedPair()` 只接受新建 PC 的即时采样结果；bytes 开始前强制 `sampleNow()` 并重跑 gate |
-| 4 | Relay 计数仅在连接关闭时落账，无法做传输前后快照；存在竞态 | 计数改为 `atomic.Uint64` 实时逐字节累计；每 5s 输出 `relay_counter_snapshot` + SIGUSR1 即时快照；停止时关闭活动连接并等待双向拷贝退出；新增 relay 计数/停止竞态测试（`go test -race` 通过） |
-| 5 | Browser listener 未认证 dialer、无 server-side gate | listener 必填预期 dialer 公钥；入站连接过 inbound gate 后进入 approved set（connection.id）；三个协议 handler 先查 approved set，明确拒绝 limited/relay 连接 |
-| 6 | bytes 响应头假设一次读到 ≥40 字节 | 改为增量状态机解析：累计 ≥8B 解析 total、尾部保留 32B 作 trailer、中间全部进 hasher；单测覆盖 1/7/39 字节碎片化及截断/超发场景 |
+## 9. 下一步
 
-其他建议落实：Go 侧 bytes 增加 8 GiB 上限、每流 2h deadline、全局并发 ≤8；
-NAS multiaddr 追加 `/p2p/<PeerId>` 直接可复制；TTFB/heap delta 进入 `bytes_result`
-事件；`gofmt -l` 清零；vitest 超时放宽至 30s 消除首跑波动。
+1. 先补 WSS 的 JS/Go 或 JS/目标供应商跨语言 echo 与 identity 实验；
+2. 按新的 Wire Messages 实现最小 Stat/Read 双 stream lab handler；
+3. 完成 I02–I15，并回填真实版本、网络环境、耗时、哈希与内存数据；
+4. 对 WebRTC Direct 与 WSS 分别生成性能基线；
+5. 实验通过后再进入正式 MSFile 实现。
 
-## 5. 待办（进入阶段 B–E）
+在 I02–I15 完成前，只能裁决“协议方向已锁定、identity vector 已互通”，不能声称完整的
+WebRTC Direct/WSS MSFile 协议已经跨语言通过。
 
-1. 准备公网 NAS（IPv6 或 IPv4/UDP 端口映射）+ HTTPS/WSS Relay 部署；
-2. 按 §14 阶段 B–C 顺序执行 T02–T07、T09、T14 并回填证据；
-3. 回填浏览器版本、NAT 类型、selected candidate pair、Relay 前后字节对照；
-4. 清理临时私钥与未脱敏日志后给出最终裁决。
+---
 
-## 6. 最终裁决（占位）
+## 参考资料
 
-待矩阵全部形成证据后填写：
-“transport 与同钥身份是否跑得通、是否足以进入正式 MSFile 实现”。
+- [js-libp2p WebRTC transport](https://github.com/libp2p/js-libp2p/tree/main/packages/transport-webrtc)
+- [libp2p WebRTC Direct specification](https://github.com/libp2p/specs/blob/master/webrtc/webrtc-direct.md)
+- [js-libp2p WebSockets transport](https://github.com/libp2p/js-libp2p/tree/main/packages/transport-websockets)
+- [libp2p connection and stream specification](https://github.com/libp2p/specs/blob/master/connections/README.md)

@@ -2,9 +2,8 @@
 
 > 状态：V1 报文设计真值。
 >
-> 本文只定义 MSFile 的 stream 模型、二进制 framing、deterministic CBOR 报文、
-> `stat`、`acquire`、`read` 三个命令、状态、幂等和内容验证。节点发现、WebRTC 建连、
-> Relay 边界、私钥身份和公钥白名单见
+> 本文定义 MSFile 的 libp2p stream 使用方式、二进制 Frame、deterministic CBOR 报文、
+> `stat`、`read`、请求覆盖、取消和内容校验。节点身份、transport、供应商调度和连接生命周期见
 > [MSFile Proxy Network Protocol v1](./network.zh.md)。
 
 ---
@@ -14,96 +13,87 @@
 MSFile V1 统一规定：
 
 1. libp2p protocol ID 是 `/msfile/1.0.0`；
-2. 一条 libp2p stream 恰好承载一个请求和一个响应，响应完成后关闭 stream；
-3. 物理 WebRTC connection 可以同时复用多条 MSFile stream；
-4. `stat` 和 `read` 没有 `request_id`，stream 本身就是请求—响应关联标识；
-5. `acquire` 携带 16 字节 `idempotency_key`，它是业务幂等键，不是传输 request ID；
-6. 控制 Header 使用 RFC 8949 deterministic CBOR fixed array；
-7. Seed 和文件块使用 raw attachment，不进入 CBOR，不使用 JSON、Base64 或 hex；
-8. decoder 不依赖 RTCDataChannel 消息边界，必须按本文长度字段从 stream 读取；
-9. 文件唯一内容地址是 MasterSeed V1 `seed_hash`；
-10. `stat(discover=false)` 只返回 `available` 或 `absent`；
-11. `available` 和 `quoted` 必须携带完整且已验证的 Seed；
-12. `absent` 和 `discovering` 不携带文件详情或 Seed；
-13. `read` 按 256 KiB 块编号随机读取，支持跳跃播放；
-14. BitFSProxy 的发现、报价请求、购买和缓存频率由 Proxy 自主管理，不由 Stat 轮询驱动；
-15. 连接身份来自 libp2p 已认证公钥，报文不重复携带公钥或 API Key。
+2. 每个已认证供应商 connection 最多保留一条 Stat stream 和一条 Read stream；
+3. 一条 stream 可以连续承载多个请求和响应，且两个方向可以同时读写；
+4. 同一方向的 Frame 必须完整串行写入，不允许交叉写入两个 Frame；
+5. Stat 与 Read 使用不同 stream，避免大块内容阻塞频繁状态查询；
+6. StatResponse 和 ReadResponse 可以不按请求顺序返回，使用递增的 request ID 关联；
+7. `stat` 可以反复查询同一 `seed_hash`，不传输 Seed 内容；
+8. `read` 按内容哈希读取 Seed 或文件块，同时表达本次内容购买的最高价格授权；
+9. 不再定义 `Acquire`、`quote_id`、`acquisition_id`、`priority` 或额外幂等键；
+10. Header 使用 RFC 8949 deterministic CBOR fixed array；
+11. 内容使用 raw attachment，不进入 CBOR，不使用 JSON、Base64 或 hex；
+12. 客户端以 `SHA-256(content_bytes) == content_hash` 验证所有返回内容；
+13. 连接身份来自 libp2p 已认证远端公钥，报文不重复携带客户端或供应商身份。
 
-MSFile 是 Keymaster 到已配置 Proxy 的文件服务协议，不是 BitFS 买卖双方 wire 的替代品。
+MSFile 是 Keymaster 到已配置供应商的文件服务协议，不是供应商内部发现、付款和结算协议。
 
 ---
 
-## 2. 为什么 V1 不需要通用 Request ID
+## 2. Stream 模型
 
-WebRTC DataChannel 支持多路 libp2p stream。V1 使用如下模型：
+### 2.1 两条长驻 stream
+
+每个供应商 connection 使用：
 
 ```text
-WebRTC Connection
-  ├── Stream A: StatRequest    -> StatResponse
-  ├── Stream B: ReadRequest 12 -> ReadResponse 12
-  ├── Stream C: ReadRequest 13 -> ReadResponse 13
-  └── Stream D: AcquireRequest -> AcquireResponse
+Authenticated libp2p Connection
+  ├── Stat stream: StatRequest* -> StatResponse* / ErrorResponse*
+  └── Read stream: ReadRequest* -> ReadResponse* / ReadCancelled* / ErrorResponse*
 ```
 
-每条 stream 只有一个请求者和一个响应者，响应不能跑到另一条 stream，因此：
+- Stat stream 在连接可用后建立并长期复用；
+- Read stream 可以延迟到第一次 Read 时建立并长期复用；
+- 两条 stream 都协商 `/msfile/1.0.0`；
+- 客户端打开 stream，供应商只接受，不反向创建 MSFile stream；
+- stream 收到的第一个 Request Kind 锁定其角色：Kind 1 为 Stat，Kind 3 为 Read；
+- 角色锁定后出现另一类 Request Kind 属于 `wrong_stream_role`；
+- 正常空闲不关闭 stream；连接关闭、stream Reset 或协议错误后按需重建。
 
-- 同时读取多个块时，每个块使用独立 stream；
-- 某条 stream 超时、Reset 或关闭，不影响其他请求的关联；
-- 不需要在报文中再维护一套 `request_id -> waiter` 映射；
-- 不存在同一 stream 内响应乱序问题。
+V1 不为每次 Stat 或 Read 新建 stream，也不把 Stat 和 Read 混入同一条 stream。
 
-只有未来允许“一条 stream 内流水化多个并发请求且响应可以乱序”时，才需要引入通用
-`request_id`。该变化属于新的 wire 版本，V1 实现不得自行扩展。
+### 2.2 全双工与乱序
 
-`idempotency_key` 解决的是另一件事：Acquire 可能产生购买副作用。如果连接在 Proxy 已经
-接受请求后断开，调用方必须用相同幂等键在新 stream 上重试，避免重复购买。
+libp2p stream 是可靠、有序、双向的字节流。客户端可以继续发送请求，同时供应商发送之前请求
+的响应。供应商可以并发执行多个请求，并按完成顺序把完整响应 Frame 加入单一写队列：
 
----
+```text
+Client -> Supplier: Read(101, hash_A), Read(102, hash_B), Read(103, hash_A)
+Supplier -> Client: ReadResponse(103), ReadCancelled(101, replaced_by=103), ReadResponse(102)
+```
 
-## 3. Stream 生命周期
+“响应可以乱序”不表示字节可以乱序。每个方向只能有一个 Frame writer；一个带 attachment 的
+ReadResponse 开始写入后，必须写完该 Header 和全部 `content_bytes`，才能写下一个 Frame。
 
-请求方按以下顺序操作：
+### 2.3 request ID 作用域
 
-1. 在已经通过 Network Protocol `direct_ready` 检查的具体 connection 上打开
-   `/msfile/1.0.0` stream；
-2. 写入一个完整 Request Frame；
-3. 不再向该 stream 写入第二个请求；
-4. 读取一个完整 Response Frame；
-5. 验证 Header、attachment 和业务内容；
-6. 正常关闭 stream。
+```text
+stat_request_id : uint64
+read_request_id : uint64
+```
 
-响应方按以下顺序操作：
+- 两个计数器彼此独立；
+- 客户端在当前已认证 libp2p connection 内分别单调递增；
+- stream 重建但 connection 未变时不得倒退；
+- 新 connection 可以重新从 `1` 开始；
+- `0` 不作为客户端生成的 request ID；
+- 达到 `2^64 - 1` 后必须重建 connection，禁止回绕；
+- request ID 只关联请求，不是公钥、内容 ID 或付款凭证。
 
-1. 读取一个完整 Request Frame；
-2. 严格解码并执行身份、权限、尺寸和业务检查；
-3. 写入对应的成功 Response 或 ErrorResponse；
-4. 不再写入第二个响应；
-5. 正常关闭 stream。
-
-如果一方在完整 Frame 后继续发送额外字节，接收方必须 Reset stream。连接可以保留，除非
-实现的滥用策略决定关闭整个 connection。
-
-以下事件只作用于当前请求：
-
-- stream Reset；
-- stream EOF 早于声明长度；
-- Header 超长；
-- attachment 长度不符；
-- CBOR 或业务校验失败。
-
-不得把上述事件映射成业务 `absent`。
+同一 stream 的请求字节本身有序，因此供应商可以在解码入口检查序号。重复或倒退且不属于本文
+定义的“已被新请求覆盖”的报文返回 `stale_request_id`。
 
 ---
 
-## 4. Frame 外形
+## 3. Frame 外形
 
-每个请求和响应都是一个 Frame：
+每条消息都是一个 Frame：
 
 ```text
 frame = header_length_uvarint || header_cbor || attachment
 ```
 
-### 4.1 `header_length_uvarint`
+### 3.1 `header_length_uvarint`
 
 - 使用 unsigned LEB128 / protobuf-style uvarint；
 - 必须使用最短编码；
@@ -111,74 +101,88 @@ frame = header_length_uvarint || header_cbor || attachment
 - 值必须在 `1..65536`；
 - 超长、溢出、非最短编码或值为 0 均为 framing error。
 
-### 4.2 `header_cbor`
+### 3.2 `header_cbor`
 
 - 必须是 RFC 8949 deterministic CBOR；
 - 顶层必须是 definite-length array；
 - 禁止 indefinite-length item；
 - 整数必须使用最短编码；
-- map 不用于 V1 wire；
+- V1 Header 不使用 map；
 - text string 必须是合法 UTF-8；
 - 未声明字段、额外数组元素和错误分支长度一律拒绝。
 
-### 4.3 `attachment`
-
-- attachment 是紧跟 Header 的原始字节；
-- 其长度由对应 Header 的 `attachment_length` 字段唯一确定；
-- 没有 attachment 的消息其长度隐含为 0，不增加占位字段；
-- decoder 必须先校验 Header 和声明长度上限，再分配或读取 attachment；
-- decoder 不得依赖一次 stream read、一次 RTCDataChannel message 或一个 JS event 对应一个
-  Frame。
-
-### 4.4 固定上限
+所有 Header 前两个元素固定为：
 
 ```text
-MAX_HEADER_BYTES       = 65536
-MAX_SEED_BYTES         = 16777216
-MAX_BLOCK_BYTES        = 262144
+[wire_version, wire_kind, ...]
+```
+
+V1 的 `wire_version` 固定为 `1`。
+
+### 3.3 `attachment`
+
+- attachment 是紧跟 Header 的原始字节，不在 CBOR 内；
+- V1 只有成功的 ReadResponse 携带 attachment；
+- `content_length` 唯一确定 attachment 的字节数和下一个 Frame 的起点；
+- decoder 必须先验证 Header 与长度上限，再读取或分配 attachment；
+- decoder 必须读取 exact `content_length`，不得依赖一次 stream read 或一次
+  RTCDataChannel/WebSocket 消息对应一个 Frame；
+- attachment 读取不足是截断错误；多出的字节属于下一 Frame，不能吞并。
+
+### 3.4 固定上限
+
+```text
+MAX_HEADER_BYTES        = 65536
+MAX_SEED_BYTES          = 16777216
+MAX_BLOCK_BYTES         = 262144
+MAX_CONTENT_BYTES       = 16777216
 MAX_ERROR_MESSAGE_BYTES = 1024
 ```
 
-V1 不允许压缩 Header、Seed 或块。传输层可以执行自己的拥塞控制，但不能改变 wire 字节。
+V1 不压缩 Header、Seed 或文件块。transport 可以自行分片，但不能改变 Frame 字节。
 
 ---
 
-## 5. MasterSeed 文件模型
+## 4. 内容模型
 
-### 5.1 常量
+### 4.1 哈希与块
 
 ```text
-MASTERSEED_FORMAT     = keymaster-seed-v1
 BLOCK_SIZE_BYTES      = 262144
 DIGEST_SIZE_BYTES     = 32
 HASH_ALGORITHM        = SHA-256
-MAX_SEED_BYTES        = 16777216
 MAX_SOURCE_FILE_BYTES = 137438953472
 ```
 
-### 5.2 SeedHash
+wire 中的 `seed_hash` 和 `content_hash` 都是固定 32 字节 CBOR bstr。展示层可以编码成 64 个
+小写 hex 字符，但 wire 上不得发送 hex text。
 
-wire 中的 `seed_hash` 是固定 32 字节 CBOR bstr：
+本文在数组定义中使用 `content_hash`，它就是需求讨论中的 `hash` 字段：
 
 ```text
-seed_hash = SHA-256(seed_bytes)
+content_hash = SHA-256(content_bytes)
 ```
 
-它不是源文件完整字节的 SHA-256。展示层可以转成 64 个小写 hex 字符，但 hex 不是 wire
-格式。
+它可以指向两类内容：
 
-### 5.3 Seed 内容
+- `seed_hash`：MasterSeed 内容的哈希；
+- `block_hash`：单个源文件块的哈希。
+
+请求中不再发送 `block_index` 或内容类型。客户端根据调用上下文知道当前哈希是 Seed 还是块。
+
+### 4.2 MasterSeed
 
 ```text
+seed_hash  = SHA-256(seed_bytes)
+
 seed_bytes =
   block_hash[0] || block_hash[1] || ... || block_hash[n-1]
 
 block_hash[i] = SHA-256(source_block[i])
 ```
 
-每个块哈希是 32 字节原始 SHA-256。Seed 通过 Stat 成功响应的 raw attachment 传输。
-
-### 5.4 文件尺寸与块数量
+每个块哈希是 32 字节原始 SHA-256。Seed 不再通过 StatResponse 返回，而是通过
+`Read(seed_hash, max_price_satoshis)` 获取。
 
 ```text
 file_size_bytes = 0:
@@ -190,66 +194,65 @@ file_size_bytes > 0:
 len(seed_bytes) = block_count * 32
 ```
 
-空文件合法，对应零字节 Seed 和 SHA-256 空输入的 SeedHash。
+空文件合法，对应零字节 Seed；其 SeedHash 是 SHA-256 空输入。
+
+### 4.3 验证责任
+
+客户端读取 Seed 时必须验证：
+
+```text
+content_hash == requested_seed_hash
+SHA-256(content_bytes) == requested_seed_hash
+content_length <= MAX_SEED_BYTES
+content_length % 32 == 0
+content_length == block_count(file_size_bytes) * 32
+```
+
+读取文件块时必须验证：
+
+```text
+content_hash == requested_block_hash
+SHA-256(content_bytes) == requested_block_hash
+content_length <= MAX_BLOCK_BYTES
+```
+
+如果客户端掌握可信文件尺寸，还必须检查最后一块的精确长度。所有检查通过后才能把内容交给
+播放器、文件系统或缓存。
 
 ---
 
-## 6. Wire Kind 注册表
-
-所有 Header 前两个元素固定为：
-
-```text
-[wire_version, wire_kind, ...]
-```
-
-V1 的 `wire_version` 固定为 `1`。
+## 5. Wire Kind 注册表
 
 | Kind | 名称 | 方向 | Attachment |
 |---:|---|---|---|
-| 1 | `StatRequest` | Client -> Proxy | 无 |
-| 2 | `StatResponse` | Proxy -> Client | `available/quoted` 为 Seed |
-| 3 | `AcquireRequest` | Client -> Proxy | 无 |
-| 4 | `AcquireResponse` | Proxy -> Client | 无 |
-| 5 | `ReadRequest` | Client -> Proxy | 无 |
-| 6 | `ReadResponse` | Proxy -> Client | `available` 为文件块 |
-| 255 | `ErrorResponse` | Proxy -> Client | 无 |
+| 1 | `StatRequest` | Client -> Supplier | 无 |
+| 2 | `StatResponse` | Supplier -> Client | 无 |
+| 3 | `ReadRequest` | Client -> Supplier | 无 |
+| 4 | `ReadResponse` | Supplier -> Client | `content_bytes` |
+| 5 | `ReadCancelled` | Supplier -> Client | 无 |
+| 255 | `ErrorResponse` | Supplier -> Client | 无 |
 
-请求 Kind 决定本 stream 的唯一合法成功响应：
+`AcquireRequest` 和 `AcquireResponse` 已删除。Kind 3、4 直接用于 Read；本协议尚未部署，不保留
+旧草案 Kind 的兼容占位。
+
+合法响应关系：
 
 ```text
-1 -> 2
-3 -> 4
-5 -> 6
-any request -> 255
+StatRequest -> StatResponse | ErrorResponse
+ReadRequest -> ReadResponse | ReadCancelled | ErrorResponse
 ```
-
-收到其他 Kind、收到 Response 作为首帧、或收到第二个 Frame 都必须 Reset stream。
 
 ---
 
-## 7. 通用字段类型
+## 6. 通用字段
 
-### 7.1 整数
+### 6.1 整数
 
-- 所有金额、时间、尺寸和索引都是 CBOR unsigned integer；
-- V1 最大值是 `2^64 - 1`，具体字段可以有更小上限；
+- request ID、金额、时间和尺寸都是 CBOR unsigned integer；
+- 最大值是 `2^64 - 1`，具体字段可以有更小上限；
 - 禁止负数、浮点数、tagged bignum 和 text number。
 
-### 7.2 标识符
-
-```text
-idempotency_key : 16-byte bstr
-quote_id        : 32-byte bstr
-acquisition_id  : 32-byte bstr
-```
-
-- `idempotency_key` 由调用方用密码学安全随机数生成；
-- `quote_id` 和 `acquisition_id` 由 Proxy 生成；
-- 三者在展示或配置中可以编码为小写 hex，但 wire 上只允许 bstr；
-- ID 只在签发它的 Proxy 和已经认证的客户端公钥之间有意义；
-- ID 不得用作 libp2p PeerId、公钥、SeedHash 或文件块哈希。
-
-### 7.3 文件名
+### 6.2 建议文件名
 
 `recommended_filename` 是 UTF-8 text string，可以为空。非空时必须：
 
@@ -257,519 +260,392 @@ acquisition_id  : 32-byte bstr
 - 不含 `/`、`\\`、NUL 和控制字符；
 - 不是 `.` 或 `..`；
 - UTF-8 编码不超过 255 字节；
-- 不包含 Proxy 本机路径。
+- 不包含供应商本机路径。
 
-调用方不能直接把建议文件名拼接成本地路径。
+客户端不能直接把建议文件名拼接成本地路径。
 
-### 7.4 Media Type
+### 6.3 Media Type
 
 `media_type` 是 UTF-8 text string，可以为空。非空时必须是不含控制字符、长度不超过
-255 字节的 ASCII MIME media type。它只用于展示和播放提示。
+255 字节的 ASCII MIME media type。它只用于展示和播放提示，不参与内容校验。
 
-### 7.5 Retry After
+### 6.4 价格
 
-`retry_after_ms` 是 `0..3600000` 的 unsigned integer。它只是建议调用方下一次轮询的
-最短等待时间，不控制 Proxy 的远端发现或购买频率。
+所有 `*_price_satoshis` 都以聪为单位，是单个内容对象的价格，不是累计预算。
+
+StatResponse 中的最小值和最大值是供应商当前观察到的价格范围，只用于展示和决策，不构成
+不可变报价。最终购买授权只由 ReadRequest 的 `max_price_satoshis` 决定。
 
 ---
 
-## 8. Stat
+## 7. Stat
 
-### 8.1 StatRequest（Kind 1）
+### 7.1 StatRequest（Kind 1）
 
 ```text
 [1, 1,
-  seed_hash,
-  discover
+  stat_request_id,
+  seed_hash
 ]
 ```
 
-字段：
-
-| Index | 字段 | 类型 | 约束 |
+| Index | 字段 | 类型 | 中文含义与约束 |
 |---:|---|---|---|
-| 0 | `wire_version` | uint | 固定 `1` |
-| 1 | `wire_kind` | uint | 固定 `1` |
-| 2 | `seed_hash` | bstr | 固定 32 字节 |
-| 3 | `discover` | bool | 是否允许建立发现意图 |
+| 0 | `wire_version` | uint | 固定为 `1` |
+| 1 | `wire_kind` | uint | 固定为 `1` |
+| 2 | `stat_request_id` | uint64 | 当前 connection 内单调递增的 Stat 请求序号 |
+| 3 | `seed_hash` | 32-byte bstr | 要查询的 MasterSeed 哈希 |
 
-StatRequest 没有 attachment，也没有 `request_id`。
+StatRequest 没有 attachment。
 
-### 8.2 状态值
+客户端可以频繁、重复查询同一 `seed_hash`。供应商必须为每个合法 StatRequest 返回终态响应；
+客户端收到乱序响应时，对同一供应商和同一 `seed_hash` 只采用最大 `stat_request_id` 对应的状态。
+
+Stat 轮询只观察状态。供应商可以在第一次查询时按自身策略建立去重的发现任务，但重复 Stat：
+
+- 不得一对一产生远端广播；
+- 不得一对一产生购买；
+- 不得绕过供应商自身的退避、TTL 和资源限制。
+
+### 7.2 状态值
 
 ```text
-1 = available
-2 = absent
-3 = discovering
-4 = quoted
+1 = available    // 内容已在当前供应商本地就绪
+2 = absent       // 当前没有内容，也没有可报告的发现状态
+3 = discovering  // 正在发现内容或价格
+4 = quoted       // 已发现元数据和当前价格范围
 ```
 
-### 8.3 Available StatResponse
+### 7.3 Available StatResponse
 
 ```text
 [1, 2,
+  stat_request_id,
   1,
   recommended_filename,
   file_size_bytes,
-  media_type,
-  seed_length
+  media_type
 ]
-|| seed_bytes
 ```
 
-`seed_length` 必须等于 attachment 长度，且不得超过 16 MiB。
+`available` 表示供应商已经验证完整 Seed 和所有文件块，Read 可以直接从本地内容存储返回。
+StatResponse 本身不携带 Seed 或其他 attachment。
 
-`available` 的唯一含义是 Proxy 当前拥有全部文件块，并已经验证：
-
-```text
-SHA-256(seed_bytes) == request.seed_hash
-```
-
-以及 Seed 中所有块哈希与本地完整文件一致。
-
-### 8.4 Absent StatResponse
+### 7.4 Absent StatResponse
 
 ```text
 [1, 2,
+  stat_request_id,
   2
 ]
 ```
 
-没有 attachment。`absent` 不携带文件名、尺寸、类型、Seed、报价或占位信息。
+`absent` 只表示该供应商当前没有可报告结果；它不能代表供应商网络不可达。
 
-### 8.5 Discovering StatResponse
+### 7.5 Discovering StatResponse
 
 ```text
 [1, 2,
+  stat_request_id,
   3,
   retry_after_ms
 ]
 ```
 
-没有 attachment。`discovering` 不携带文件详情。
+`retry_after_ms` 是 `0..3600000` 的建议最短轮询间隔，不控制供应商内部发现频率。
 
-### 8.6 Quoted StatResponse
+### 7.6 Quoted StatResponse
 
 ```text
 [1, 2,
+  stat_request_id,
   4,
   recommended_filename,
   file_size_bytes,
   media_type,
-  seed_length,
-  quote_id,
-  seed_price_satoshis,
-  full_block_price_satoshis,
-  expires_at_unix_seconds
+  min_seed_price_satoshis,
+  max_seed_price_satoshis,
+  min_full_block_price_satoshis,
+  max_full_block_price_satoshis
 ]
-|| seed_bytes
 ```
 
-Proxy 只有取得并验证完整 Seed 后才能进入 `quoted`。`quote_id` 必须在服务端不可变地
-绑定到：
+| 字段 | 中文含义 |
+|---|---|
+| `min_seed_price_satoshis` | 当前观察到的 Seed 最低价格 |
+| `max_seed_price_satoshis` | 当前观察到的 Seed 最高价格 |
+| `min_full_block_price_satoshis` | 当前观察到的一个完整 256 KiB 文件块最低价格 |
+| `max_full_block_price_satoshis` | 当前观察到的一个完整 256 KiB 文件块最高价格 |
 
-- 已认证客户端压缩公钥；
-- SeedHash；
-- 文件详情和完整 Seed；
-- Seed 价格与完整块价格；
-- 过期时间。
-
-客户端不解析 `quote_id`，也不接触 BitFSProxy 内部 Seller 报价对象。
-
-### 8.7 `discover=false`
-
-只允许返回：
-
-- `available`：Proxy 当前拥有完整且验证过的文件；
-- `absent`：Proxy 当前没有完整文件。
-
-即使 Proxy 内部已经发现中、有报价、正在购买或缓存部分文件块，只要完整文件没有就绪，
-本请求一律返回 `absent`。
-
-`stat(false)` 不建立、刷新、重试、取消或暴露任何发现和购买任务。
-
-### 8.8 `discover=true`
-
-Proxy 按以下优先级返回：
-
-```text
-available > quoted > discovering > absent
-```
-
-第一次请求可以建立按 `client_public_key + seed_hash` 去重的发现意图。重复请求：
-
-- 复用已有发现意图；
-- 不一对一发布远端请求；
-- 不改变 BitFSProxy 自己的广播、退避和重试频率；
-- 不刷新发现任务 TTL；
-- 只返回当前状态投影。
+每组最小值必须小于或等于对应最大值。价格范围不携带 `quote_id`、过期时间或付款凭证。
 
 ---
 
-## 9. Acquire
+## 8. Read
 
-### 9.1 AcquireRequest（Kind 3）
+### 8.1 ReadRequest（Kind 3）
 
 ```text
 [1, 3,
-  idempotency_key,
-  seed_hash,
-  quote_id,
-  max_seed_price_satoshis,
-  max_full_block_price_satoshis,
-  max_total_price_satoshis
+  read_request_id,
+  content_hash,
+  max_price_satoshis
 ]
 ```
 
-AcquireRequest 没有 attachment。
+| Index | 字段 | 类型 | 中文含义与约束 |
+|---:|---|---|---|
+| 0 | `wire_version` | uint | 固定为 `1` |
+| 1 | `wire_kind` | uint | 固定为 `3` |
+| 2 | `read_request_id` | uint64 | 当前 connection 内单调递增的 Read 请求序号 |
+| 3 | `content_hash` | 32-byte bstr | Seed 或文件块的 SHA-256 |
+| 4 | `max_price_satoshis` | uint64 | 本次内容允许的最高价格；`0` 表示不限制 |
 
-Proxy 必须在接受前验证：
+ReadRequest 没有 attachment。
 
-1. 当前连接公钥在允许 Acquire 的白名单策略中；
-2. 报价由本 Proxy 发出并绑定当前连接公钥；
-3. 报价 SeedHash 与请求一致；
-4. 报价尚未过期；
-5. Seed 和块价格不超过对应上限；
-6. acquisition 累计支出不得超过总预算；
-7. 同一客户端公钥下该幂等键未绑定另一份不同请求。
+`max_price_satoshis` 是一次内容购买授权：
 
-`max_total_price_satoshis = 0` 表示不授权任何付费动作，不表示无限预算。免费报价仍可接受。
+- 正整数表示供应商只能在实际价格不超过该值时购买；
+- `0` 明确表示客户端接受任意价格；
+- `0` 不是“仅免费”，也不是字段缺省值；
+- SDK、UI 和配置层必须要求调用方显式选择“不限制”，不得因未初始化而自动发送 `0`；
+- 供应商不得把一个 Read 的上限当成整个文件或整个会话的累计预算。
 
-### 9.2 AcquireResponse（Kind 4）
+供应商的价格判断必须等价于：
+
+```text
+price_authorized =
+  max_price_satoshis == 0 || actual_price_satoshis <= max_price_satoshis
+```
+
+### 8.2 同一内容的授权覆盖
+
+供应商按以下键维护当前 connection 上尚未终结的读取状态：
+
+```text
+(authenticated_client_public_key, content_hash)
+```
+
+对同一个 `content_hash` 重复 Read 的目的，是修改当前有效的 `max_price_satoshis`：
+
+1. 更大的 `read_request_id` 完成格式、权限和金额校验后，成为最新请求；
+2. 尚未开始发送终态响应的较小请求被覆盖；
+3. 每个被覆盖请求返回一个 ReadCancelled；
+4. 获取任务、已下载字节和缓存应尽量复用，不得因为更新授权而重复购买同一内容；
+5. 成功内容通过最新有效的 `read_request_id` 返回；
+6. 不同 `content_hash` 之间互不覆盖，可以并发执行。
+
+只有通过完整校验的新请求才能覆盖旧请求。畸形、未授权或价格非法的新请求不得取消仍有效的
+旧请求。
+
+### 8.3 不可逆价格边界
+
+新请求可以提高或降低尚未承诺的价格上限，但不能撤销已经发生的付款承诺：
+
+- 尚未承诺付款：立即采用新上限并取消旧请求；
+- 已承诺价格不超过新上限：复用结果，把成功内容关联到新请求；
+- 已承诺价格超过新上限：新请求返回 `price_already_committed`，旧请求继续按原授权终结；
+- connection 关闭后禁止开始新的付款，但已经不可逆的付款不能由传输断开撤销。
+
+供应商内部必须为同一客户端与同一内容去重购买；request ID 不能作为购买去重键。
+
+### 8.4 ReadResponse（Kind 4）
 
 ```text
 [1, 4,
-  acquisition_id
+  read_request_id,
+  content_hash,
+  content_length
 ]
+|| content_bytes
 ```
 
-没有 attachment。`acquisition_id` 必须绑定：
+| Index | 字段 | 类型 | 中文含义与约束 |
+|---:|---|---|---|
+| 0 | `wire_version` | uint | 固定为 `1` |
+| 1 | `wire_kind` | uint | 固定为 `4` |
+| 2 | `read_request_id` | uint64 | 成功请求的序号 |
+| 3 | `content_hash` | 32-byte bstr | 必须等于该请求的目标哈希 |
+| 4 | `content_length` | uint64 | 后续 raw attachment 的精确字节数 |
 
-- 当前客户端压缩公钥；
-- SeedHash；
-- 已接受报价；
-- 三个预算上限。
+`content_bytes` 可以是 Seed，也可以是一个文件块，所以统一称为内容字节，不称为
+`block_bytes`。成功响应同时承诺供应商遵守了该请求的 `max_price_satoshis`。
 
-Acquire 成功只表示 Proxy 已经接受报价和预算，不表示完整文件或任意块已经就绪，也不表示
-已经发生付款。
+V1 ReadResponse 不回传实际成交价格；实际扣款记录和可审计结算属于供应商/钱包账务层。如果
+未来要求在 MSFile wire 内核对实付金额，必须提升协议版本，不能向该数组追加可选字段。
 
-### 9.3 幂等规则
-
-同一已认证客户端公钥使用相同 `idempotency_key`：
-
-- exact 请求重试：返回第一次持久化的相同成功或 ErrorResponse；
-- 请求字段不同：返回 `idempotency_conflict`；
-- stream Reset、连接断开或超时时：调用方必须使用原键重试；
-- 调用方不得因为没有收到响应就生成新键；
-- Proxy 必须在执行任何可能付款的动作前持久化幂等状态。
-
-V1 不要求 AcquireRequest 再做一层业务签名。当前连接已经通过同一业务 secp256k1 私钥的
-libp2p Noise 身份认证。需要离线不可否认证据的购买系统可以在未来版本增加签名文档，但不
-得作为 V1 的隐式可选字段。
-
----
-
-## 10. Read
-
-### 10.1 Read Mode
-
-```text
-0 = local_only
-1 = acquisition
-```
-
-### 10.2 本地 ReadRequest（Kind 5）
+### 8.5 ReadCancelled（Kind 5）
 
 ```text
 [1, 5,
-  seed_hash,
-  block_index,
-  0
+  read_request_id,
+  content_hash,
+  replaced_by_request_id
 ]
 ```
 
-只读取 Proxy 当前已经验证的块，绝不建立发现、接受报价或触发远程购买。
+| 字段 | 中文含义 |
+|---|---|
+| `read_request_id` | 被取消的旧请求序号 |
+| `content_hash` | 被覆盖请求的内容哈希 |
+| `replaced_by_request_id` | 替代旧请求的新请求序号，必须更大 |
 
-### 10.3 Acquisition ReadRequest（Kind 5）
+ReadCancelled 是正常终态，不是协议故障。它没有 attachment。客户端收到后必须结束旧请求的
+等待状态，但不得取消替代它的新请求。
 
-```text
-[1, 5,
-  seed_hash,
-  block_index,
-  1,
-  acquisition_id
-]
-```
+### 8.6 响应开始后的竞态
 
-Proxy 必须验证 acquisition 绑定当前连接公钥和 SeedHash。未缓存时可以把目标块提升为
-远程取得优先级，但相同 acquisition、SeedHash、块编号的并发请求必须合并，不能重复购买。
+ReadResponse Header 一旦进入 stream 写队列并开始发送，就不能再被后来的请求截断，否则接收方
+无法定位 attachment 和下一 Frame。因此：
 
-ReadRequest 没有 attachment，也没有 `request_id`。每个并发块请求使用独立 stream。
+- 新请求在旧 ReadResponse 开始发送前到达：旧请求返回 ReadCancelled，新请求返回内容；
+- 新请求在旧 ReadResponse 开始发送后到达：旧响应必须完整发送；新请求仍必须获得自己的终态，
+  供应商复用缓存结果再次返回 ReadResponse，不得重复购买；
+- 客户端可以忽略已被本地更大序号覆盖的旧成功响应，但仍必须把整个 Frame 读完并校验边界。
 
-### 10.4 Read 状态值
-
-```text
-1 = available
-2 = pending
-3 = unavailable
-```
-
-### 10.5 块已就绪
-
-```text
-[1, 6,
-  1,
-  block_index,
-  block_length
-]
-|| block_bytes
-```
-
-`block_length` 必须等于 attachment 长度且不得超过 262144。响应中的 `block_index` 必须与
-请求相同。
-
-调用方必须已经保存并验证对应 Seed，然后计算：
-
-```text
-expected_block_hash =
-  seed_bytes[block_index * 32 : block_index * 32 + 32]
-
-SHA-256(block_bytes) == expected_block_hash
-```
-
-除最后一块外，块长度必须恰为 262144。最后一块长度由文件尺寸计算。校验成功前，调用方
-不得把字节交给播放器、插件或 Connect App。
-
-### 10.6 块正在获取
-
-```text
-[1, 6,
-  2,
-  block_index,
-  retry_after_ms
-]
-```
-
-没有 attachment。调用方等待建议时间后，在新 stream 上重复同一个 ReadRequest。重复读取
-不得重复购买。
-
-### 10.7 块不可用
-
-```text
-[1, 6,
-  3,
-  block_index
-]
-```
-
-没有 attachment。`local_only` 下没有当前块时返回该状态。它是正常业务结果，不是
-ErrorResponse。
-
-### 10.8 块编号与随机读取
-
-`block_index` 从 0 开始。空文件没有合法块编号。需求方可以任意顺序和并发读取：
-
-```text
-0, 1, 2, 836, 837, 400, 401
-```
-
-媒体播放器把文件偏移换算为：
-
-```text
-block_index     = floor(file_offset / 262144)
-offset_in_block = file_offset mod 262144
-```
-
-Proxy 不得要求从文件开头顺序读取到目标位置。
+这是全双工并发下不可消除的边界。实现不得通过截断 attachment 来强行保证“较小序号总是取消”。
 
 ---
 
-## 11. ErrorResponse（Kind 255）
+## 9. ErrorResponse（Kind 255）
 
-任何请求都可以返回：
+StatRequest 或 ReadRequest 都可以返回：
 
 ```text
 [1, 255,
+  request_kind,
+  request_id,
   error_code,
   error_message,
   retry_after_ms
 ]
 ```
 
-字段：
+| 字段 | 中文含义与约束 |
+|---|---|
+| `request_kind` | 失败请求的 Kind，只能是 `1` 或 `3` |
+| `request_id` | 失败请求的 `stat_request_id` 或 `read_request_id` |
+| `error_code` | 小写 ASCII 稳定错误码，最多 64 字节 |
+| `error_message` | 诊断文本，UTF-8，最多 1024 字节，可以为空 |
+| `retry_after_ms` | `0..3600000`；`0` 表示没有重试建议 |
 
-- `error_code`：本文注册的小写 ASCII text string，最多 64 字节；
-- `error_message`：诊断用 UTF-8 text string，最多 1024 字节，可以为空；
-- `retry_after_ms`：`0` 表示没有重试建议。
+客户端只能依赖 `error_code`，不得解析 `error_message`。诊断文本不得包含私钥、完整白名单、
+本机路径、交易原文、内部堆栈或内容字节。
 
-调用方只能依赖 `error_code`。`error_message` 不得包含私钥、完整公钥白名单、本机路径、
-BitFS Seller 私密信息、交易原文或内部堆栈。
-
-| Error Code | 含义 |
+| Error Code | 中文含义 |
 |---|---|
 | `bad_request` | CBOR、字段、类型或范围错误 |
-| `invalid_seed_hash` | SeedHash 长度或值不合法 |
-| `unauthorized_peer` | 连接公钥不在白名单或没有当前命令权限 |
-| `direct_connection_required` | MSFile 被错误地尝试运行在间接或受限连接上 |
-| `quote_not_found` | 本 Proxy 找不到报价 |
-| `quote_expired` | 报价已经过期 |
-| `price_limit_exceeded` | 报价或累计支出超过上限 |
-| `idempotency_conflict` | 同一幂等键绑定了不同 AcquireRequest |
-| `acquisition_not_found` | acquisition 不存在或不属于当前连接公钥 |
-| `acquisition_expired` | acquisition 已失效 |
-| `block_out_of_range` | 块编号超出可信 Seed 范围 |
-| `integrity_error` | Seed、块哈希或长度验证失败 |
-| `rate_limited` | 超过 Proxy 调用或并发策略 |
 | `unsupported_version` | 不支持 wire version |
-| `internal_error` | Proxy 内部错误 |
+| `wrong_stream_role` | 在已锁定角色的 stream 上发送了另一类命令 |
+| `stale_request_id` | request ID 重复、倒退或已经失效 |
+| `invalid_content_hash` | SeedHash 或内容哈希长度/值非法 |
+| `unauthorized_peer` | 已认证公钥没有当前命令权限 |
+| `content_not_found` | 当前无法找到指定哈希的内容 |
+| `price_limit_exceeded` | 当前价格超过 Read 授权上限 |
+| `price_already_committed` | 已承诺价格高于后来降低的新上限 |
+| `acquisition_failed` | 供应商获取内容失败 |
+| `integrity_error` | 供应商或客户端检测到内容长度/哈希错误 |
+| `rate_limited` | 超过频率、并发、带宽或预算策略 |
+| `internal_error` | 供应商内部错误 |
 
-连接建立失败、ICE 失败、stream Reset 和超时属于 Transport 错误，不编码为 ErrorResponse，
-也不能映射成 `absent` 或 `unavailable`。
-
----
-
-## 12. Stat 状态矩阵
-
-| 请求 | 完整文件 | 部分缓存 | 发现中 | 有有效报价 | 完全没有 |
-|---|---|---|---|---|---|
-| `discover=false` | `available` + Seed | `absent` | `absent` | `absent` | `absent` |
-| `discover=true` | `available` + Seed | 按发现真值 | `discovering` | `quoted` + Seed + quote | `discovering` 或 `absent` |
-
-最后一格取决于 Proxy 能力和策略：只读 NAS 返回 `absent`；能够并愿意发现的 BitFSProxy
-建立去重发现意图并返回 `discovering`。
+连接建立失败、stream Reset、EOF 和超时属于 Transport 错误，不能编码成业务 `absent`。
 
 ---
 
-## 13. 端到端验证
+## 10. 标准流程
 
-### 13.1 Available / Quoted
-
-客户端必须按固定顺序：
-
-1. 验证 Frame 长度和 Header CBOR；
-2. 验证响应 Kind 与当前请求匹配；
-3. 验证状态分支的固定数组长度；
-4. 按 `seed_length` 读取 exact attachment；
-5. 验证 Seed 长度是 32 的整数倍且不超过 16 MiB；
-6. 验证 `SHA-256(seed_bytes) == request.seed_hash`；
-7. 根据文件尺寸计算块数量并与 Seed 哈希数量比较；
-8. `quoted` 再验证报价、价格和过期时间；
-9. 全部成功后才保存文件详情与 Seed。
-
-任何失败都拒绝整个响应，不能降级为 `absent`。
-
-### 13.2 Read
-
-客户端必须：
-
-1. 已经保存同一 SeedHash 的已验证 Seed 和文件尺寸；
-2. 在发送前检查块编号范围；
-3. 验证响应块编号与请求一致；
-4. 验证声明长度、实际长度及最后块长度；
-5. 自己计算块 SHA-256；
-6. 与 Seed 中对应摘要比较；
-7. 成功后才交付给上层。
-
-知道 SeedHash 但没有可信 Seed 时，无法验证随机文件块，不能执行 Read。
-
----
-
-## 14. 背压、并发与取消
-
-- 实现必须尊重 libp2p stream 和 RTCDataChannel 的背压；
-- 逻辑块是 256 KiB，不表示可以一次 `send()` 256 KiB；
-- encoder 必须按当前 transport 的安全 `maxMessageSize` 主动把连续 Frame 字节切成多个
-  stream write，V1 建议每片不超过 16 KiB；
-- 实现不能假定 libp2p 或 RTCDataChannel 会自动把超大 `send()` 安全分片；
-- attachment 在 wire 上仍是连续 exact bytes，分片对 decoder 不可见；
-- 调用方可以并发打开多条 Read stream，但 Proxy 可以设置每公钥、每 connection 和全局上限；
-- 超过上限返回 `rate_limited`，不得静默转到 Relay；
-- 取消单个 Read 通过 Reset 对应 stream 实现；
-- 一个等待者取消不得取消其他客户端或其他 stream 共享的底层块获取任务；
-- 连接断开后，上层可以在重新形成 `direct_ready` connection 后按块重试。
-
----
-
-## 15. 标准流程
-
-### 15.1 静态文件或 NAS
+### 10.1 多供应商状态查询
 
 ```text
-Stream A:
-  StatRequest(seed_hash, false)
-  -> available Header + raw seed attachment
-
-客户端验证 Seed
-
-Stream B:
-  ReadRequest(seed_hash, block=0, local_only)
-  -> available Header + raw block attachment
-
-客户端验证块
+Supplier A Stat stream: Stat(41, seed_hash) -> Quoted(41, ...)
+Supplier B Stat stream: Stat(18, seed_hash) -> Absent(18)
+Supplier C: connection timeout
 ```
 
-### 15.2 BitFSProxy 发现报价
+客户端把 A、B 的结果分别绑定到各 connection 已认证的供应商公钥。C 是网络错误，不是
+`absent`。
+
+### 10.2 获取 Seed 后随机读取
 
 ```text
-Stream A: StatRequest(seed_hash, true) -> discovering
+Read(100, seed_hash, max_seed_price)
+  -> ReadResponse(100, seed_hash, seed_length) || seed_bytes
 
-// Proxy 按自己的频率发现；Stat 轮询不驱动远端请求
+客户端验证 SeedHash，并从 Seed 取得 block_hash[836]
 
-Stream B: StatRequest(seed_hash, true) -> quoted + Seed + quote
+Read(101, block_hash[836], max_block_price)
+  -> ReadResponse(101, block_hash[836], block_length) || block_bytes
 ```
 
-### 15.3 报价后跳跃播放
+播放器不需要读取块 `0..835`。
+
+### 10.3 更新价格授权
 
 ```text
-Stream A: AcquireRequest(idempotency_key, quote...) -> acquisition_id
-Stream B: ReadRequest(block=0, acquisition_id)      -> available + block 0
-Stream C: ReadRequest(block=836, acquisition_id)    -> pending
-Stream D: ReadRequest(block=836, acquisition_id)    -> available + block 836
+Read(200, block_hash, 50)
+Read(201, block_hash, 80)
+
+-> ReadCancelled(200, block_hash, 201)
+-> ReadResponse(201, block_hash, content_length) || content_bytes
 ```
 
-播放器不需要先下载块 `1..835`。
+客户端通过控制 Read 发送顺序实现调度：跳转播放时暂停或缩小后台预读窗口，优先发送目标块，
+不需要 wire `priority` 字段。
 
 ---
 
-## 16. 明确不属于 V1 的能力
+## 11. 背压与资源控制
+
+- encoder 和 decoder 必须尊重 libp2p stream 背压；
+- WebRTC transport 上不得假设一次写入等于一个 RTCDataChannel message；
+- WSS transport 上不得假设一次写入等于一个 WebSocket message；
+- 实现建议以不超过 16 KiB 的片段推进 Frame 字节，但该分片不是 wire 边界；
+- Read stream 可以并发执行多个请求，但 response writer 必须逐 Frame 串行；
+- 单个 16 MiB Seed 响应会阻塞同一 Read stream 后续响应，这是 V1 接受的队头阻塞；
+- Stat 使用独立 stream，因此不会被 Seed 或文件块 attachment 阻塞；
+- 供应商应限制每公钥、每 connection 和全局的未完成 Read 数、缓存、内存与带宽；
+- 达到资源上限返回 `rate_limited` 或关闭连接，不得静默丢弃请求；
+- stream 关闭时所有尚未终结的请求进入传输失败，上层可在重连后重新发送。
+
+---
+
+## 12. 明确不属于 V1 的能力
 
 V1 不定义：
 
-- 同一 stream 内多个请求或乱序响应；
-- 通用 `request_id`；
+- Acquire 命令和独立 acquisition 生命周期；
+- `quote_id`、`acquisition_id`、`priority`、`block_index` 或随机幂等键；
+- StatResponse 携带 Seed；
 - JSON、Base64、HTTP endpoint 或 API Key；
-- TURN 或通过 Circuit Relay 承载业务报文；
-- 每个 Stat/Read 的业务签名；
-- list、put、delete、rename 和目录操作；
-- 文件上传、NAS 导入和价格设置；
+- 每个 Stat/Read 的额外业务签名或应用层握手；
 - 任意 Byte Range；调用方在 256 KiB 块内自行切片；
-- BitFS Seller、费用池、付款、仲裁和交易报文；
-- 缓存目录、淘汰算法和后台补全顺序；
-- Connect SDK 的 App 权限和用户确认 UI；
-- 压缩、批量 Read 或一条 stream 连续推送视频。
+- 文件上传、目录、删除、重命名和价格设置；
+- 供应商内部 Seller、付款、仲裁、费用池和交易报文；
+- 在 ReadResponse 内报告实际成交价格；
+- 压缩、批量 Read 或跨 Frame 交错 attachment。
 
-上述能力如需进入 wire，必须提升协议版本，不能通过额外数组元素或猜测 optional 字段兼容。
+新增字段、改变数组长度或改变 Kind 含义都必须提升 protocol/wire 版本。
 
 ---
 
-## 17. 验收范围
+## 13. 验收范围
 
 实现至少覆盖：
 
-- 多条并发 stream 的响应不串线；
-- 一条 stream 第二个请求或响应被拒绝；
+- Stat 与 Read 各自长驻 stream，重复请求无需新建 stream；
+- 请求和响应全双工，多个响应可乱序但 Frame 字节不交错；
+- request ID 单调性、关联、过期响应淘汰和 `uint64` 边界；
+- 同一 hash 的更大 Read 覆盖旧授权，并为旧请求返回 ReadCancelled；
+- 新请求校验失败不取消旧请求；
+- ReadResponse 已开始发送时不被截断，竞态分支不重复购买；
 - uvarint 非最短、溢出、Header 超限和 attachment 截断；
-- 非 deterministic CBOR、indefinite item、额外数组元素和错误分支；
-- `stat(false)` 屏蔽 discovering、quoted、部分缓存和购买状态；
-- 重复 `stat(true)` 不产生等量远端请求且不刷新任务 TTL；
-- `absent/discovering` 携带 attachment 被拒绝；
-- `available/quoted` 缺 Seed、SeedHash 错误和尺寸不匹配被拒绝；
-- Acquire stream 断开后同幂等键重试不重复购买；
-- 同幂等键不同请求返回冲突；
-- Read 随机跳块、pending、并发同块合并；
-- 越界块、错误块、错误响应块编号和最后块长度被拒绝；
-- stream/connection 错误与业务 `absent/unavailable` 严格区分；
-- 大块发送遵守背压且内存使用不随并发无限增长。
+- deterministic CBOR、固定数组长度、UTF-8 和字段范围；
+- Stat 四种状态无 attachment，频繁轮询不一对一驱动远端购买；
+- Seed 与块均通过 `content_hash` 读取和验证；
+- `max_price_satoshis = 0` 只在客户端显式授权时产生；
+- 价格超过上限、已承诺价格和内容获取失败的终态；
+- 连接/stream 错误与业务 `absent` 严格区分；
+- 大 attachment 遵守背压且内存不随并发无限增长。
 
 ---
 
@@ -778,4 +654,4 @@ V1 不定义：
 - [MasterSeed / Keymaster Seed V1](https://github.com/bsv8/MasterSeed)
 - [RFC 8949 · CBOR](https://www.rfc-editor.org/rfc/rfc8949)
 - [Protocol Buffers · Base 128 Varints](https://protobuf.dev/programming-guides/encoding/#varints)
-- [libp2p Streams](https://docs.libp2p.io/concepts/multiplex/overview/)
+- [libp2p Connections and Streams](https://github.com/libp2p/specs/blob/master/connections/README.md)
