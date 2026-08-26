@@ -33,7 +33,13 @@ type dirtyRecorder struct {
 	paths []string // 收到的 relativePath（可能为空字符串）
 }
 
-func (d *dirtyRecorder) MarkDirty(relativePath, _ string) {
+func (d *dirtyRecorder) MarkSeedDirty(seedHashHex, _ string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.paths = append(d.paths, seedHashHex)
+}
+
+func (d *dirtyRecorder) MarkLocationDirty(relativePath, _ string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.paths = append(d.paths, relativePath)
@@ -159,7 +165,8 @@ func (e *testEnv) commitLocation(t *testing.T, res *seed.Result, relativePath st
 	t.Helper()
 	ctx := context.Background()
 	now := time.Now()
-	revision, err := e.db.PrepareIndex(ctx, relativePath, 0, now)
+	revision, err := e.db.PrepareIndex(ctx, relativePath, 0, now,
+		indexdb.TargetFingerprint{SizeBytes: sizeBytes, MtimeNs: mtimeNs}, false)
 	if err != nil {
 		t.Fatalf("PrepareIndex(%s) 失败: %v", relativePath, err)
 	}
@@ -219,7 +226,11 @@ func TestStatReportsReadyInvalidAndMissing(t *testing.T) {
 	}
 
 	// 唯一位置被事件标记失效后，即使 .seed 文件仍在也不得声称 available。
-	if err := env.db.MarkInvalidNow(ctx, "电影/a.mkv", "测试：事件确认文件消失", time.Now()); err != nil {
+	fpsMark, fpsErr := env.db.ListFingerprints(ctx)
+	if fpsErr != nil {
+		t.Fatal(fpsErr)
+	}
+	if err := env.db.MarkInvalidNow(ctx, "电影/a.mkv", "测试：事件确认文件消失", time.Now(), fpsMark["电影/a.mkv"].Revision); err != nil {
 		t.Fatalf("标记位置失效失败: %v", err)
 	}
 	if _, ok, err := env.reader.Stat(ctx, res.HashHex()); err != nil || ok {
@@ -252,7 +263,11 @@ func TestReadSeedMatchesPublishedAndFailsClosed(t *testing.T) {
 	}
 
 	// 所有位置 invalid 后必须拒绝提供。
-	if err := env.db.MarkInvalidNow(ctx, "电影/a.mkv", "测试失效", time.Now()); err != nil {
+	fpsInv2, invErr2 := env.db.ListFingerprints(ctx)
+	if invErr2 != nil {
+		t.Fatal(invErr2)
+	}
+	if err := env.db.MarkInvalidNow(ctx, "电影/a.mkv", "测试失效", time.Now(), fpsInv2["电影/a.mkv"].Revision); err != nil {
 		t.Fatalf("标记位置失效失败: %v", err)
 	}
 	if _, err := env.reader.ReadSeed(ctx, res.HashHex()); !errors.Is(err, ErrUnavailable) {
@@ -278,8 +293,8 @@ func TestReadSeedMatchesPublishedAndFailsClosed(t *testing.T) {
 	if data != nil {
 		t.Fatal("完整性失败时不得返回任何字节")
 	}
-	if !env.dirty.contains("") {
-		t.Fatalf("Seed 损坏应向 dirty listener 发送空路径通知，实际收到: %v", env.dirty.snapshot())
+	if !env.dirty.contains(res.HashHex()) {
+		t.Fatalf("Seed 损坏应向 dirty listener 发送该 seed_hash 通知，实际收到: %v", env.dirty.snapshot())
 	}
 }
 

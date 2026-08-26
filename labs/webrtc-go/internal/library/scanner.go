@@ -80,10 +80,11 @@ func (c *Coordinator) executeScan(ctx context.Context, startedAt time.Time) (int
 	}
 
 	var (
-		confirm   = make([]indexdb.TouchAction, 0, len(fingerprints))
-		seen      = make(map[string]struct{}, len(fingerprints))
-		walkErrs  = make([]string, 0, 8)
-		scheduled = 0
+		pendingVerify = map[string][]indexdb.TouchAction{} // seedHash -> 确认候选
+		seen          = make(map[string]struct{}, len(fingerprints))
+		walkErrs      = make([]string, 0, 8)
+		scheduled     = 0
+		confirm       []indexdb.TouchAction
 	)
 
 	err = filepath.WalkDir(c.nasRoot, func(path string, d fs.DirEntry, walkError error) error {
@@ -124,11 +125,22 @@ func (c *Coordinator) executeScan(ctx context.Context, startedAt time.Time) (int
 		seen[rel] = struct{}{}
 		fp, known := fingerprints[rel]
 
+		// 已有在途索引任务的位置：本轮不确认也不重复调度，
+		// 交给 PrepareIndex 的指纹去重决定是否推进（阻断 1）。
+		if known && fp.State == indexdb.LocationIndexing {
+			return nil
+		}
+		dev, ino := deviceInode(fingerprint{sys: info.Sys()})
+		scanFP := indexdb.TargetFingerprint{
+			SizeBytes: info.Size(), MtimeNs: info.ModTime().UnixNano(),
+			DeviceID: dev, Inode: ino,
+		}
+
 		if info.Size() > seed.MaxSourceBytes {
 			failCtx, failCancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer failCancel()
 			reason := fmt.Sprintf("文件尺寸 %d 超过 MSFile V1 最大源文件尺寸 %d 字节", info.Size(), seed.MaxSourceBytes)
-			if err := c.db.SetLocationFailed(failCtx, rel, info.Size(), info.ModTime().UnixNano(), reason); err != nil {
+			if err := c.db.SetLocationFailed(failCtx, rel, info.Size(), info.ModTime().UnixNano(), reason, fp.Revision); err != nil {
 				walkErrs = append(walkErrs, rel+"："+reason)
 			} else {
 				c.log.Emit("library_scan_unsupported_size", map[string]any{"path_zh": rel, "reason_zh": reason})
@@ -136,22 +148,22 @@ func (c *Coordinator) executeScan(ctx context.Context, startedAt time.Time) (int
 			return nil
 		}
 
-		dev, ino := deviceInode(fingerprint{sys: info.Sys()})
 		if known && fp.SeedHash != "" &&
 			fp.SizeBytes == info.Size() && fp.MtimeNs == info.ModTime().UnixNano() &&
 			!deviceInodeContradicts(fp, dev, ino) { // 指纹一致：valid 直接确认；invalid/error 在保留期内恢复为 valid，
 			// 复用 SQLite 块映射和原 Seed，不重新计算（需求 §7.2）。
-			confirm = append(confirm, indexdb.TouchAction{
-				RelativePath: rel,
-				SizeBytes:    info.Size(),
-				MtimeNs:      info.ModTime().UnixNano(),
-				DeviceID:     dev,
-				Inode:        ino,
+			pendingVerify[fp.SeedHash] = append(pendingVerify[fp.SeedHash], indexdb.TouchAction{
+				RelativePath:  rel,
+				KnownRevision: fp.Revision,
+				SizeBytes:     info.Size(),
+				MtimeNs:       info.ModTime().UnixNano(),
+				DeviceID:      dev,
+				Inode:         ino,
 			})
 			return nil
 		}
-		// 新增、变化或身份无法确认：进入稳定性检测与 Hash 队列。
-		c.SchedulePath("全量扫描发现新增或变化文件", generation, rel)
+		// 新增、变化或身份无法确认：进入稳定性检测与 Hash 队列（携带扫描指纹）。
+		c.ScheduleFromScan("全量扫描发现新增或变化文件", generation, rel, scanFP)
 		scheduled++
 		return nil
 	})
@@ -186,6 +198,23 @@ func (c *Coordinator) executeScan(ctx context.Context, startedAt time.Time) (int
 			KnownRevision: fp.Revision,
 			ErrorZh:       reasonZh,
 		})
+	}
+
+	// 阻断 2：复用前校验 .seed 存在且 SHA-256 正确；每个唯一 Hash 只读一次。
+	confirm = make([]indexdb.TouchAction, 0, len(pendingVerify))
+	for seedHash, actions := range pendingVerify {
+		if err := c.store.VerifySeed(seedHash); err != nil {
+			c.log.Emit("library_scan_seed_corrupt", map[string]any{
+				"seed_hash": seedHash,
+				"reason_zh": "复用前完整性校验失败，强制重建：" + err.Error(),
+			})
+			for _, action := range actions {
+				c.SchedulePath("Seed 文件损坏，强制重建", generation, action.RelativePath)
+				scheduled++
+			}
+			continue
+		}
+		confirm = append(confirm, actions...)
 	}
 
 	now := c.clk.Now()

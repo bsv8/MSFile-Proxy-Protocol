@@ -119,11 +119,11 @@ func (s *Store) Publish(result *Result) error {
 		return err
 	}
 	if err := os.Rename(tmpName, target); err != nil {
-		// 并发发布同一 Seed：目标已出现即视为成功
 		if errors.Is(err, os.ErrExist) {
 			return nil
 		}
-		if info, statErr := os.Stat(target); statErr == nil && info.Size() == int64(len(result.Seed)) {
+		// rename 失败但目标已存在（并发发布竞态）：只有完整 Hash 校验通过才视为成功。
+		if verifyErr := verifySeedFile(target, hashHex, int64(len(result.Seed))); verifyErr == nil {
 			return nil
 		}
 		return fmt.Errorf("原子发布 Seed 失败: %w", err)
@@ -306,6 +306,40 @@ func (s *Store) WalkSeeds(visit func(hashHex string, modTime time.Time) error) e
 				}
 			}
 		}
+	}
+	return nil
+}
+
+// VerifySeed 校验已发布 Seed 文件存在且 SHA-256 与 Hash 一致（阻断 2）。
+func (s *Store) VerifySeed(hashHex string) error {
+	hashHex = strings.ToLower(hashHex)
+	if err := validateHash(hashHex); err != nil {
+		return err
+	}
+	path := s.path(hashHex)
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("%w：%s", ErrNotFound, hashHex)
+	}
+	if err != nil {
+		return err
+	}
+	// 长度校验放宽为 32 字节对齐（空 Seed 合法），内容做完整 SHA-256。
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	digest := sha256.New()
+	size, err := io.Copy(digest, file)
+	if err != nil {
+		return err
+	}
+	if size != info.Size() {
+		return fmt.Errorf("Seed %s 读取长度异常", hashHex)
+	}
+	if hex.EncodeToString(digest.Sum(nil)) != hashHex {
+		return fmt.Errorf("Seed %s 内容 SHA-256 不匹配", hashHex)
 	}
 	return nil
 }

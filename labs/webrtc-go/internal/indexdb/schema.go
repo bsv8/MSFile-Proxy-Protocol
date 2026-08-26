@@ -11,7 +11,8 @@ import (
 
 // SchemaVersion 是当前唯一支持的 schema 版本。
 // 硬切换不允许原地改写不兼容旧 schema；检测到旧表时必须中文报错并拒绝启动。
-const SchemaVersion = 1
+// v2：新增 index_jobs 表（任务目标指纹去重，阻断 1 活锁修复），纯增量迁移。
+const SchemaVersion = 2
 
 // ErrIncompatibleSchema 表示数据库里存在旧版（objects 仓库 / clients 白名单）schema。
 var ErrIncompatibleSchema = errors.New("检测到不兼容的旧版数据库：该 SQLite 包含旧对象仓库或 clients 白名单表。" +
@@ -69,21 +70,45 @@ CREATE TABLE IF NOT EXISTS scan_runs (
 	status TEXT NOT NULL CHECK(status IN ('running','succeeded','partial','failed')),
 	error_zh TEXT NOT NULL DEFAULT ''
 ) STRICT;
+
+CREATE TABLE IF NOT EXISTS index_jobs (
+	relative_path TEXT PRIMARY KEY,
+	size_bytes INTEGER NOT NULL DEFAULT 0 CHECK(size_bytes >= 0),
+	mtime_ns INTEGER NOT NULL DEFAULT 0 CHECK(mtime_ns >= 0),
+	device_id INTEGER,
+	inode INTEGER,
+	forced INTEGER NOT NULL DEFAULT 0 CHECK(forced IN (0,1)),
+	updated_at INTEGER NOT NULL
+) STRICT;
 `
 
 // openRaw 打开底层连接、校验 schema 并应用 PRAGMA；只允许在启动阶段调用一次。
+// 对瞬时 SQLITE_BUSY（前一个进程尚未完全释放文件锁）做有界重试，
+// 但不兼容 schema 等永久性错误立即返回。
 func openRaw(path string) (*sql.DB, error) {
-	raw, err := openSQLDB(path)
-	if err != nil {
-		return nil, err
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := configureAndMigrate(ctx, raw); err != nil {
+	var lastErr error
+	for attempt := 0; attempt < 8; attempt++ {
+		raw, err := openSQLDB(path)
+		if err != nil {
+			return nil, err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		migrateErr := configureAndMigrate(ctx, raw)
+		cancel()
+		if migrateErr == nil {
+			return raw, nil
+		}
 		_ = raw.Close()
-		return nil, err
+		lastErr = migrateErr
+		busy := strings.Contains(migrateErr.Error(), "locked") ||
+			strings.Contains(migrateErr.Error(), "busy") ||
+			strings.Contains(migrateErr.Error(), "SQLITE_BUSY")
+		if !busy {
+			return nil, migrateErr
+		}
+		time.Sleep(time.Duration(attempt+1) * 150 * time.Millisecond)
 	}
-	return raw, nil
+	return nil, fmt.Errorf("数据库持续被占用（可能有旧进程未退出）: %w", lastErr)
 }
 
 func configureAndMigrate(ctx context.Context, raw *sql.DB) error {
@@ -116,7 +141,12 @@ func configureAndMigrate(ctx context.Context, raw *sql.DB) error {
 			return err
 		}
 	default:
-		if version != fmt.Sprintf("%d", SchemaVersion) {
+		if version == fmt.Sprintf("%d", SchemaVersion-1) {
+			// 相邻版本的纯增量迁移：只允许 CREATE TABLE IF NOT EXISTS 类语句。
+			if err := createSchema(ctx, raw); err != nil {
+				return err
+			}
+		} else if version != fmt.Sprintf("%d", SchemaVersion) {
 			return fmt.Errorf("检测到未知 schema 版本 %q（期望 %d）；请备份后使用空 seed_data 重建索引", version, SchemaVersion)
 		}
 	}

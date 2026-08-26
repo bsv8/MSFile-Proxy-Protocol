@@ -1,6 +1,7 @@
 package msfile
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
@@ -205,4 +206,28 @@ func Error(kind, id uint64, code, message string, retryAfter uint64) []any {
 		}
 	}
 	return []any{WireVersion, KindErrorResponse, kind, id, code, message, retryAfter}
+}
+
+// EncodeRequest 把请求字段数组编码为完整 Frame 并写入 w。
+// 供客户端实现复用同一套 deterministic CBOR 与 framing 规则。
+func EncodeRequest(w io.Writer, fields []any) error {
+	return WriteFrame(w, fields, nil, 0)
+}
+
+// DecodeResponseFields 从流中读取一个响应 Frame 的 CBOR 字段数组。
+// attachment（若有）留在流中，由调用方按 content_length 继续读取。
+func DecodeResponseFields(r io.Reader) ([]any, error) {
+	buffered, ok := r.(io.ByteReader)
+	if !ok {
+		buffered = bufio.NewReader(r)
+	}
+	header, err := readHeader(buffered)
+	if err != nil {
+		return nil, err
+	}
+	var fields []any
+	if err := decMode.Unmarshal(header, &fields); err != nil {
+		return nil, fmt.Errorf("CBOR Header 无效: %w", err)
+	}
+	return fields, nil
 }

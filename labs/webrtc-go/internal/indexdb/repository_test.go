@@ -62,7 +62,8 @@ func mustCommit(t *testing.T, db *DB, relativePath, seedHash string, now time.Ti
 	for _, block := range blocks {
 		totalSize += block.LengthBytes
 	}
-	revision, err := db.PrepareIndex(context.Background(), relativePath, generation, now)
+	revision, err := db.PrepareIndex(context.Background(), relativePath, generation, now,
+		TargetFingerprint{SizeBytes: totalSize, MtimeNs: now.UnixNano()}, false)
 	if err != nil {
 		t.Fatalf("PrepareIndex(%s) 失败: %v", relativePath, err)
 	}
@@ -416,7 +417,7 @@ func TestInvalidatePathsCoalesceAndRevisionGuard(t *testing.T) {
 	}
 
 	// KnownRevision 守卫：PrepareIndex（生产入口）之后旧快照的失效动作必须整体跳过。
-	newRev, err := tdb.PrepareIndex(bg, path, 8, t2.Add(time.Second))
+	newRev, err := tdb.PrepareIndex(bg, path, 8, t2.Add(time.Second), TargetFingerprint{}, true)
 	if err != nil {
 		t.Fatalf("PrepareIndex 失败: %v", err)
 	}
@@ -469,7 +470,12 @@ func TestConfirmSeenPathsRestoresLocation(t *testing.T) {
 	}
 
 	seenAt := t1.Add(time.Minute)
-	err := tdb.ConfirmSeenPaths(bg, []TouchAction{{RelativePath: path, SizeBytes: 555, MtimeNs: 777}}, 42, seenAt)
+	err := tdb.ConfirmSeenPaths(bg, []TouchAction{{
+		RelativePath:  path,
+		KnownRevision: fpsVar450[path].Revision,
+		SizeBytes:     555,
+		MtimeNs:       777,
+	}}, 42, seenAt)
 	if err != nil {
 		t.Fatalf("ConfirmSeenPaths 失败: %v", err)
 	}
@@ -515,7 +521,11 @@ func TestMarkInvalidNowAndLocationFailure(t *testing.T) {
 	seed := hexHash('a', 33)
 	mustCommit(t, tdb.DB, path, seed, now, 1, singleBlock(seed, hexHash('b', 303)))
 
-	if err := tdb.MarkInvalidNow(bg, path, "inotify 确认文件消失", time.Now()); err != nil {
+	revSnap0, snapErr0 := tdb.ListFingerprints(bg)
+	if snapErr0 != nil {
+		t.Fatal(snapErr0)
+	}
+	if err := tdb.MarkInvalidNow(bg, path, "inotify 确认文件消失", time.Now(), revSnap0[path].Revision); err != nil {
 		t.Fatalf("MarkInvalidNow 失败: %v", err)
 	}
 	fps, err := tdb.ListFingerprints(bg)
@@ -533,7 +543,7 @@ func TestMarkInvalidNowAndLocationFailure(t *testing.T) {
 	firstSince := *loc.InvalidSince
 
 	time.Sleep(5 * time.Millisecond) // 让 time.Now() 明确推进，证明 COALESCE 生效
-	if err := tdb.MarkInvalidNow(bg, path, "第二次标记", time.Now().Add(time.Second)); err != nil {
+	if err := tdb.MarkInvalidNow(bg, path, "第二次标记", time.Now().Add(time.Second), revSnap0[path].Revision); err != nil {
 		t.Fatalf("第二次 MarkInvalidNow 失败: %v", err)
 	}
 	loc = getLocation(t, tdb.DB, bg, seed, path, now.Add(2*time.Minute))
@@ -541,9 +551,9 @@ func TestMarkInvalidNowAndLocationFailure(t *testing.T) {
 		t.Errorf("重复 MarkInvalidNow 不得刷新 invalid_since：期望 %v，实际 %v", firstSince, loc.InvalidSince)
 	}
 
-	// SetLocationFailed：路径不存在时创建占位行，且不带 seed_hash。
+	// SetLocationFailed：路径不存在时创建占位行（插入分支不受 CAS 约束），且不带 seed_hash。
 	failPath := "oversize/raw.iso"
-	if err := tdb.SetLocationFailed(bg, failPath, 9_000_000_000, 1234567890, "超过协议最大源文件尺寸"); err != nil {
+	if err := tdb.SetLocationFailed(bg, failPath, 9_000_000_000, 1234567890, "超过协议最大源文件尺寸", 0); err != nil {
 		t.Fatalf("SetLocationFailed 失败: %v", err)
 	}
 	fps, err = tdb.ListFingerprints(bg)
@@ -561,8 +571,12 @@ func TestMarkInvalidNowAndLocationFailure(t *testing.T) {
 		t.Errorf("占位行字段不符：%+v", placeholder)
 	}
 
-	// 再次调用按 upsert 语义更新同一行而不是插入新行。
-	if err := tdb.SetLocationFailed(bg, failPath, 1, 2, "尺寸信息修正"); err != nil {
+	// 再次调用按 CAS 语义更新同一行而不是插入新行。
+	fpsNow, fpsErr := tdb.ListFingerprints(bg)
+	if fpsErr != nil {
+		t.Fatal(fpsErr)
+	}
+	if err := tdb.SetLocationFailed(bg, failPath, 1, 2, "尺寸信息修正", fpsNow[failPath].Revision); err != nil {
 		t.Fatalf("SetLocationFailed 更新失败: %v", err)
 	}
 	fps, err = tdb.ListFingerprints(bg)
@@ -909,10 +923,14 @@ func TestDeleteLocationsGuarded(t *testing.T) {
 	}
 
 	// 快照之后：shared1 恢复为 valid（模拟挂载恢复），shared2 被 PrepareIndex 取代（revision 变化）。
-	if err := tdb.ConfirmSeenPaths(bg, []TouchAction{{RelativePath: "del/shared1.bin"}}, 10, cutoff.Add(time.Second)); err != nil {
+	fpsRec, snapErr := tdb.ListFingerprints(bg)
+	if snapErr != nil {
+		t.Fatal(snapErr)
+	}
+	if err := tdb.ConfirmSeenPaths(bg, []TouchAction{{RelativePath: "del/shared1.bin", KnownRevision: fpsRec["del/shared1.bin"].Revision}}, 10, cutoff.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	newRev, err := tdb.PrepareIndex(bg, "del/shared2.bin", 11, cutoff.Add(time.Second))
+	newRev, err := tdb.PrepareIndex(bg, "del/shared2.bin", 11, cutoff.Add(time.Second), TargetFingerprint{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -949,10 +967,10 @@ func TestDeleteLocationsGuarded(t *testing.T) {
 	_ = newRev
 
 	// SetLocationFailed 创建的无 seed 占位行：invalid 后可删，但不产生孤儿。
-	if err := tdb.SetLocationFailed(bg, "del/failed.tmp", 1, 1, "超过协议最大源文件尺寸"); err != nil {
+	if err := tdb.SetLocationFailed(bg, "del/failed.tmp", 1, 1, "超过协议最大源文件尺寸", 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := tdb.MarkInvalidNow(bg, "del/failed.tmp", "测试失效", cutoff); err != nil {
+	if err := tdb.MarkInvalidNow(bg, "del/failed.tmp", "测试失效", cutoff, 1); err != nil {
 		t.Fatal(err)
 	}
 	orphans, err = tdb.DeleteLocations(bg, []LocationDeleteTarget{{RelativePath: "del/failed.tmp", Revision: 1}}, cutoff)
@@ -979,7 +997,7 @@ func TestOrphanContentsAndDeleteContentsCascade(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tdb.MarkInvalidNow(bg, "orphan/o.bin", "测试失效", tO.Add(time.Second)); err != nil {
+	if err := tdb.MarkInvalidNow(bg, "orphan/o.bin", "测试失效", tO.Add(time.Second), fps["orphan/o.bin"].Revision); err != nil {
 		t.Fatal(err)
 	}
 	orphans, err := tdb.DeleteLocations(bg,
@@ -1029,7 +1047,7 @@ func TestOrphanContentsAndDeleteContentsCascade(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tdb.MarkInvalidNow(bg, "keep/k.bin", "测试失效", tO.Add(time.Minute)); err != nil {
+	if err := tdb.MarkInvalidNow(bg, "keep/k.bin", "测试失效", tO.Add(time.Minute), fpsKeep["keep/k.bin"].Revision); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tdb.DeleteLocations(bg,
@@ -1162,7 +1180,8 @@ func TestPrepareIndexMakesContentUnavailableImmediately(t *testing.T) {
 		t.Fatalf("提交后应有 1 个 valid 副本: %+v err=%v", avail, err)
 	}
 
-	if _, err := tdb.PrepareIndex(bg, "cas/file.bin", 2, now.Add(time.Second)); err != nil {
+	if _, err := tdb.PrepareIndex(bg, "cas/file.bin", 2, now.Add(time.Second),
+		TargetFingerprint{SizeBytes: 263168, MtimeNs: now.Add(time.Second).UnixNano()}, true); err != nil {
 		t.Fatalf("PrepareIndex 失败: %v", err)
 	}
 	avail, err = tdb.GetAvailability(bg, seedOld)
@@ -1192,7 +1211,7 @@ func TestCommitSeedResultRevisionCAS(t *testing.T) {
 	path := "cas/race.bin"
 	seedA := hexHash('a', 62)
 
-	rev1, err := tdb.PrepareIndex(bg, path, 1, now)
+	rev1, err := tdb.PrepareIndex(bg, path, 1, now, TargetFingerprint{SizeBytes: 262144, MtimeNs: now.UnixNano()}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1208,7 +1227,8 @@ func TestCommitSeedResultRevisionCAS(t *testing.T) {
 	}
 
 	// 模拟“Publish 之后、Commit 之前”来了新事件：revision 前进。
-	rev2, err := tdb.PrepareIndex(bg, path, 2, now.Add(time.Second))
+	rev2, err := tdb.PrepareIndex(bg, path, 2, now.Add(time.Second),
+		TargetFingerprint{SizeBytes: 524288, MtimeNs: now.Add(time.Second).UnixNano()}, false)
 	if err != nil {
 		t.Fatal(err)
 	}

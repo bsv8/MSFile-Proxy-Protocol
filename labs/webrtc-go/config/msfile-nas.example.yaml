@@ -68,7 +68,9 @@ listen:
   - "/ip4/0.0.0.0/tcp/4002/ws"
 
 # 直接终止 TLS 的 WSS 证书与私钥 PEM；两者必须成对出现。
-# 配置后 WS 监听自动升级为 tls/ws。TLS 不替代 Noise 与 PeerId 校验。
+# 注意：transport 是否启用 TLS 由 listen 里的 multiaddr 显式决定——
+# 配置证书后，listen 中不允许再出现裸 /ws（请显式写成 /tls/ws），否则启动失败。
+# TLS 不替代 Noise 与 PeerId 校验。
 #tls_cert_file: "/etc/msfile-nas/tls.crt"
 #tls_key_file: "/etc/msfile-nas/tls.key"
 

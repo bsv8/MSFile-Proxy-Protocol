@@ -28,8 +28,10 @@ import (
 	"github.com/benbjohnson/clock"
 
 	"msfile.dev/labs/webrtc-go/internal/config"
+	"msfile.dev/labs/webrtc-go/internal/content"
 	"msfile.dev/labs/webrtc-go/internal/indexdb"
 	"msfile.dev/labs/webrtc-go/internal/metrics"
+	"msfile.dev/labs/webrtc-go/internal/safefs"
 	"msfile.dev/labs/webrtc-go/internal/seed"
 )
 
@@ -47,6 +49,7 @@ type testEnv struct {
 	cfg     *config.Config
 	db      *indexdb.DB
 	store   *seed.Store
+	root    *safefs.Root
 	coord   *Coordinator
 }
 
@@ -108,7 +111,13 @@ func newTestEnvFull(t *testing.T, watcherEnabled bool, clk clock.Clock) *testEnv
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	env := &testEnv{t: t, nasRoot: nasRoot, dir: dir, cfg: cfg, db: db, store: store}
-	coord, err := New(cfg, db, store, metrics.New("library-test"))
+	root, rootErr := safefs.Open(nasRoot)
+	if rootErr != nil {
+		t.Fatal(rootErr)
+	}
+	env.t.Cleanup(func() { _ = root.Close() })
+	env.root = root
+	coord, err := New(cfg, db, store, metrics.New("library-test"), root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -493,7 +502,8 @@ func TestGCRetentionBoundaryWithFakeClock(t *testing.T) {
 	if err := store.Publish(res); err != nil {
 		t.Fatal(err)
 	}
-	rev, err := db.PrepareIndex(ctx, "x.bin", 1, now)
+	rev, err := db.PrepareIndex(ctx, "x.bin", 1, now,
+		indexdb.TargetFingerprint{SizeBytes: res.SourceSize, MtimeNs: now.UnixNano()}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -502,7 +512,7 @@ func TestGCRetentionBoundaryWithFakeClock(t *testing.T) {
 	if err := db.CommitSeedResult(ctx, params, now); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.MarkInvalidNow(ctx, "x.bin", "测试预置失效", now); err != nil {
+	if err := db.MarkInvalidNow(ctx, "x.bin", "测试预置失效", now, rev+1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -538,8 +548,9 @@ func TestGCRetentionBoundaryWithFakeClock(t *testing.T) {
 	}
 
 	// 再次失效后推进到过期，跑 GC（T13）。
-	// 再次失效：发生在到期检查之前（用真实 now 作为第二次不可见时间）。
-	if err := db.MarkInvalidNow(ctx, "x.bin", "再次失效", now); err != nil {
+	// 再次失效：发生在到期检查之前（用真实 now 作为第二次不可见时间）；
+	// ConfirmSeenPaths 未推进 revision，沿用提交后的版本。
+	if err := db.MarkInvalidNow(ctx, "x.bin", "再次失效", now, rev+1); err != nil {
 		t.Fatal(err)
 	}
 	mock.Set(now.Add(25 * time.Hour))
@@ -680,7 +691,8 @@ func TestGCGuardSkipsRecoveredLocationAndLockKeepsFreshSeed(t *testing.T) {
 	if err := store.Publish(res); err != nil {
 		t.Fatal(err)
 	}
-	rev, err := db.PrepareIndex(ctx, "gc.bin", 1, now)
+	rev, err := db.PrepareIndex(ctx, "gc.bin", 1, now,
+		indexdb.TargetFingerprint{SizeBytes: res.SourceSize, MtimeNs: now.UnixNano()}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -689,7 +701,7 @@ func TestGCGuardSkipsRecoveredLocationAndLockKeepsFreshSeed(t *testing.T) {
 	if err := db.CommitSeedResult(ctx, params, now); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.MarkInvalidNow(ctx, "gc.bin", "预置失效", now); err != nil {
+	if err := db.MarkInvalidNow(ctx, "gc.bin", "预置失效", now, rev+1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -711,7 +723,10 @@ func TestGCGuardSkipsRecoveredLocationAndLockKeepsFreshSeed(t *testing.T) {
 	}
 
 	// 快照之后挂载恢复：位置回到 valid（revision 保持不变但状态已变）。
-	if err := db.ConfirmSeenPaths(ctx, []indexdb.TouchAction{{RelativePath: "gc.bin"}}, 2, cutoff); err != nil {
+	if err := db.ConfirmSeenPaths(ctx, []indexdb.TouchAction{{
+		RelativePath:  "gc.bin",
+		KnownRevision: rev + 1,
+	}}, 2, cutoff); err != nil {
 		t.Fatal(err)
 	}
 	// 守卫删除必须跳过该位置。
@@ -782,7 +797,7 @@ func TestRebuildFromEmptySeedData(t *testing.T) {
 		t.Fatal(err)
 	}
 	env.t.Cleanup(func() { _ = db2.Close() })
-	coord2, err := New(env.cfg, db2, store2, metrics.New("rebuild"))
+	coord2, err := New(env.cfg, db2, store2, metrics.New("rebuild"), env.root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -805,5 +820,151 @@ func TestRebuildFromEmptySeedData(t *testing.T) {
 	after := snapshotTree(env.t, env.nasRoot)
 	if !reflect.DeepEqual(before, after) {
 		t.Fatal("重建过程不得改变 nas_data")
+	}
+}
+
+// ---------- 阻断 1 确定性测试：同指纹调度不推进 revision（大文件活锁免疫） ----------
+
+func TestPrepareIndexDedupPreventsRescheduleLivelock(t *testing.T) {
+	env := newTestEnvWith(t, false)
+	db := env.db
+	ctx := context.Background()
+
+	base := genData(200000, 41)
+	if err := os.WriteFile(filepath.Join(env.nasRoot, "big.bin"), base, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(filepath.Join(env.nasRoot, "big.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp := indexdb.TargetFingerprint{SizeBytes: fi.Size(), MtimeNs: fi.ModTime().UnixNano()}
+	now := time.Now()
+
+	// 扫描批次 1 分配任务。
+	rev1, err := db.PrepareIndex(ctx, "big.bin", 1, now, fp, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 模拟“Hash 时间超过扫描间隔”：批次 2/3 再次看到相同文件并重复调度。
+	for gen := int64(2); gen <= 3; gen++ {
+		revN, err := db.PrepareIndex(ctx, "big.bin", gen, now.Add(time.Duration(gen)*time.Minute), fp, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if revN != rev1 {
+			t.Fatalf("同指纹重复调度不得推进 revision：rev%d vs rev%d", revN, rev1)
+		}
+	}
+
+	res := buildOf(t, base)
+	params := commitOfPath(res, now, "big.bin")
+	params.ExpectedRevision = rev1
+	if err := db.CommitSeedResult(ctx, params, now); err != nil {
+		t.Fatalf("在途任务应能以原始 revision 提交成功，实际: %v", err)
+	}
+
+	// 只有目标指纹变化才推进。
+	fi2, _ := os.Stat(filepath.Join(env.nasRoot, "big.bin"))
+	newFP := fp
+	newFP.MtimeNs = fi2.ModTime().UnixNano() + 1
+	revNew, err := db.PrepareIndex(ctx, "big.bin", 4, now.Add(time.Hour), newFP, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revNew <= rev1 {
+		t.Fatalf("指纹变化必须推进 revision：%d -> %d", rev1, revNew)
+	}
+	_ = revNew
+}
+
+// TestScanSkipsIndexingLocations：全量扫描遇到 indexing 位置既不复活也不重复调度。
+func TestScanSkipsIndexingLocations(t *testing.T) {
+	env := newTestEnvWith(t, false)
+	base := genData(150000, 42)
+	path := filepath.Join(env.nasRoot, "busy.bin")
+	writeFile(t, path, base)
+	res := buildOf(t, base)
+	env.start()
+	env.waitFor("初始索引完成", func() bool { return env.contentReady(res.HashHex()) })
+
+	// 手工制造一个在途任务（模拟大文件正在 Hash）。
+	fi, _ := os.Stat(path)
+	rev, err := env.db.PrepareIndex(context.Background(), "busy.bin", 99,
+		time.Now(), indexdb.TargetFingerprint{SizeBytes: fi.Size(), MtimeNs: fi.ModTime().UnixNano()}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !env.coord.TriggerFullScan() {
+		env.waitFor("上一轮结束", func() bool { return !env.coord.Scanning() })
+		env.coord.TriggerFullScan()
+	}
+	env.waitFor("扫描轮次结束", func() bool {
+		return !env.coord.Scanning()
+	})
+	time.Sleep(50 * time.Millisecond)
+
+	fps, err := env.db.ListFingerprints(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp := fps["busy.bin"]
+	if fp.State != indexdb.LocationIndexing || fp.Revision != rev+0 && fp.Revision < rev {
+		t.Fatalf("indexing 位置不应被扫描改动，实际 %+v（期望 revision=%d）", fp, rev)
+	}
+	if env.contentState(res.HashHex()) == indexdb.StateReady && fp.State == indexdb.LocationValid {
+		t.Fatal("重算中的位置不得被扫描复活为 valid")
+	}
+}
+
+// ---------- 阻断 2 端到端：Seed 损坏 → unavailable → 自动重建恢复 ----------
+
+func TestSeedCorruptionFlowsToRebuildAndRecovery(t *testing.T) {
+	env := newTestEnv(t)
+	base := genData(130000, 43)
+	path := filepath.Join(env.nasRoot, "corrupt-me.bin")
+	writeFile(t, path, base)
+	res := buildOf(t, base)
+	env.start()
+	env.waitFor("初始索引完成", func() bool { return env.contentReady(res.HashHex()) })
+
+	reader := content.New(env.root, env.db, env.store, env.coord)
+	ctx := context.Background()
+
+	// 篡改磁盘上的 .seed 文件（保持尺寸不变）。
+	diskSeed := filepath.Join(env.cfg.SeedData, "seeds", res.HashHex()[:2], res.HashHex()[2:4], res.HashHex()+".seed")
+	raw, err := os.ReadFile(diskSeed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[0] ^= 0xFF
+	if err := os.WriteFile(diskSeed, raw, 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read 必须返回 integrity_error 且触发标脏。
+	if _, err := reader.ReadSeed(ctx, res.HashHex()); !errors.Is(err, content.ErrIntegrity) {
+		t.Fatalf("损坏 Seed 应返回 ErrIntegrity，实际: %v", err)
+	}
+	// 后续 Stat 立即不再 available（内容已置 error）。
+	env.waitFor("Stat 不再 available", func() bool {
+		return env.contentState(res.HashHex()) != indexdb.StateReady
+	})
+	avail, err := env.db.GetAvailability(ctx, res.HashHex())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if avail.Content.State == indexdb.StateReady {
+		t.Fatal("内容级状态应为 error/invalid，不得保持 ready")
+	}
+
+	// 自动重建后 Stat/Read 恢复。
+	env.waitFor("自动重建完成", func() bool { return env.contentReady(res.HashHex()) })
+	good, err := reader.ReadSeed(ctx, res.HashHex())
+	if err != nil {
+		t.Fatalf("重建后 ReadSeed 失败: %v", err)
+	}
+	if sha256.Sum256(good) != res.SeedHash {
+		t.Fatal("重建后的 Seed 与原文件不一致")
 	}
 }

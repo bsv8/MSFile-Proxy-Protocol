@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -31,6 +32,7 @@ import (
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
+	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	webrtc "github.com/libp2p/go-libp2p/p2p/transport/webrtc"
 	websocket "github.com/libp2p/go-libp2p/p2p/transport/websocket"
 	ma "github.com/multiformats/go-multiaddr"
@@ -96,6 +98,14 @@ func New(cfg *config.Config) (*App, error) {
 	}
 	app.store = store
 
+	// 1b. 安全文件入口（支持挂载延迟就绪的惰性 Root）。
+	root, err := safefs.Open(cfg.NASData)
+	if err != nil {
+		return fail(err)
+	}
+	app.root = root
+	cleanups = append(cleanups, func() { _ = root.Close() })
+
 	// 2. 取得 service.lock：第二个实例必须被拒绝。
 	lock, err := acquireServiceLock(filepath.Join(cfg.SeedData, "service.lock"))
 	if err != nil {
@@ -112,9 +122,13 @@ func New(cfg *config.Config) (*App, error) {
 	app.db = db
 	cleanups = append(cleanups, func() { _ = db.Close() })
 
-	// 4. 恢复运行状态：把上次中断遗留的 running 扫描改为 failed。
+	// 4. 恢复运行状态：把上次中断遗留的 running 扫描改为 failed，
+	//    并把遗留的 indexing 位置转 invalid（下一轮扫描按指纹确认或重建）。
 	if err := db.ResetRunningScans(context.Background(), cfg.Clock.Now()); err != nil {
 		return fail(fmt.Errorf("恢复扫描状态失败: %w", err))
+	}
+	if err := db.RecoverStaleIndexing(context.Background(), cfg.Clock.Now()); err != nil {
+		return fail(fmt.Errorf("恢复索引任务状态失败: %w", err))
 	}
 
 	// 5. 只读 auth policy：白名单只在配置文件中。
@@ -144,24 +158,16 @@ func New(cfg *config.Config) (*App, error) {
 	app.host = h
 	cleanups = append(cleanups, func() { _ = h.Close() })
 
-	// 7. 安全文件入口；reader 的标脏事件回给协调器重新索引。
-	root, err := safefs.Open(cfg.NASData)
-	if err != nil {
-		return fail(err)
-	}
-	app.root = root
-	reader := content.New(root, db, store, nil)
-
-	// 8. 注册正式 /msfile/1.0.0 文件服务（不注册实验协议）。
-	app.msfileS = msfile.NewServer(h, reader, policy, log)
-
-	// 9. 协调器先构造（New 不启动任何 goroutine），管理面 handler 用真实协调器。
-	coord, err := library.New(cfg, db, store, log)
+	// 7. 协调器先构造（New 不启动任何 goroutine）；内容读取器带标脏联动。
+	coord, err := library.New(cfg, db, store, log, root)
 	if err != nil {
 		return fail(err)
 	}
 	app.coord = coord
 	app.reader = content.New(root, db, store, coord)
+
+	// 8. 注册正式 /msfile/1.0.0 文件服务（不注册实验协议；仅此一次）。
+	app.msfileS = msfile.NewServer(h, app.reader, policy, log)
 	app.msfileS = msfile.NewServer(h, app.reader, policy, log)
 	adminHandler := admin.New(db, coord, admin.Options{
 		AdminToken:    cfg.AdminToken,
@@ -341,12 +347,31 @@ func buildHost(priv crypto.PrivKey, cfg *config.Config) (host.Host, error) {
 			Certificates: []tls.Certificate{certificate},
 			MinVersion:   tls.VersionTLS12,
 		}))
+		// WSS 必须显式声明：transport 是否启用 TLS 由 multiaddr 决定，
+		// 提供证书不会隐式把 /ws 升级为 /tls/ws（阻断 3）。
+		for _, text := range cfg.ListenAddrs {
+			if strings.HasSuffix(text, "/ws") && !strings.HasSuffix(text, "/tls/ws") {
+				return nil, fmt.Errorf("配置错误：已配置 TLS 证书时禁止裸 /ws 监听 %q；请显式改为 /tls/ws", text)
+			}
+		}
+	}
+	// 全局 connection/stream/内存硬限额：public 模式下攻击者可无限生成新公钥，
+	// 资源上限必须由 libp2p ResourceManager 在传输层强制执行。
+	rcmgrLimits := rcmgr.DefaultLimits
+	rcmgrLimits.SystemBaseLimit.Conns = 256
+	rcmgrLimits.SystemBaseLimit.ConnsInbound = 192
+	rcmgrLimits.SystemBaseLimit.Streams = 2048
+	rcmgrLimits.SystemBaseLimit.StreamsInbound = 1024
+	resourceMgr, err := rcmgr.NewResourceManager(rcmgr.NewFixedLimiter(rcmgrLimits.AutoScale()))
+	if err != nil {
+		return nil, fmt.Errorf("初始化资源管理器失败: %w", err)
 	}
 	h, err := libp2p.New(
 		libp2p.Identity(priv),
 		libp2p.ListenAddrs(maddrs...),
 		libp2p.Transport(webrtc.New),
 		libp2p.Transport(websocket.New, wsOptions...),
+		libp2p.ResourceManager(resourceMgr),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("启动 libp2p host 失败: %w", err)
@@ -356,10 +381,8 @@ func buildHost(priv crypto.PrivKey, cfg *config.Config) (host.Host, error) {
 }
 
 // warnPlainWS 对非 loopback 的裸 WS 监听输出中文提醒：生产公网必须 WSS。
+// 与是否配置 TLS 证书无关——证书不会隐式升级监听。
 func warnPlainWS(h host.Host, cfg *config.Config) {
-	if cfg.TLSCertFile != "" {
-		return
-	}
 	for _, addr := range h.Addrs() {
 		hasWS := false
 		loopbackOnly := true

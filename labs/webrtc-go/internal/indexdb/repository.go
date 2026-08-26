@@ -164,12 +164,15 @@ func (d *DB) ListFingerprints(ctx context.Context) (map[string]Fingerprint, erro
 }
 
 // TouchAction 是一次扫描确认后的批量动作。
+// KnownRevision 是扫描快照中的版本：位置在快照后进入 indexing（新任务）
+// 或被再次失效时，确认会被跳过，绝不把重算中的位置复活为 valid。
 type TouchAction struct {
-	RelativePath string
-	SizeBytes    int64
-	MtimeNs      int64
-	DeviceID     *int64
-	Inode        *int64
+	RelativePath  string
+	KnownRevision int64
+	SizeBytes     int64
+	MtimeNs       int64
+	DeviceID      *int64
+	Inode         *int64
 }
 
 // ConfirmSeenPaths 在一个短事务内确认本轮扫描看到的文件：
@@ -187,14 +190,15 @@ func (d *DB) ConfirmSeenPaths(ctx context.Context, actions []TouchAction, genera
 		statement, err := tx.PrepareContext(ctx,
 			`UPDATE file_locations SET state = 'valid', invalid_since = NULL, last_error_zh = '',
 			    size_bytes = ?, mtime_ns = ?, device_id = ?, inode = ?, last_seen_generation = ?
-			 WHERE relative_path = ? AND seed_hash IS NOT NULL AND seed_hash <> ''`)
+			 WHERE relative_path = ? AND revision = ? AND seed_hash IS NOT NULL AND seed_hash <> ''`)
 		if err != nil {
 			return struct{}{}, err
 		}
 		defer statement.Close()
 		for _, action := range actions {
 			if _, err := statement.ExecContext(ctx, action.SizeBytes, action.MtimeNs,
-				nullInt64(action.DeviceID), nullInt64(action.Inode), generation, action.RelativePath); err != nil {
+				nullInt64(action.DeviceID), nullInt64(action.Inode), generation,
+				action.RelativePath, action.KnownRevision); err != nil {
 				return struct{}{}, fmt.Errorf("确认位置 %s 失败: %w", action.RelativePath, err)
 			}
 		}
@@ -207,7 +211,6 @@ func (d *DB) ConfirmSeenPaths(ctx context.Context, actions []TouchAction, genera
 			now.UnixNano()); err != nil {
 			return struct{}{}, fmt.Errorf("恢复有有效副本的内容失败: %w", err)
 		}
-		_ = now
 		return struct{}{}, tx.Commit()
 	})
 	return err
@@ -247,6 +250,11 @@ func (d *DB) InvalidatePaths(ctx context.Context, targets []InvalidateTarget, no
 				target.RelativePath, target.KnownRevision); err != nil {
 				return struct{}{}, fmt.Errorf("标记位置 %s 失效失败: %w", target.RelativePath, err)
 			}
+			// 该路径的未完成索引任务一并作废。
+			if _, err := tx.ExecContext(ctx,
+				`DELETE FROM index_jobs WHERE relative_path = ?`, target.RelativePath); err != nil {
+				return struct{}{}, err
+			}
 		}
 		// 内容级状态联动（需求 §7.2）：不再拥有任何 valid 位置的 ready 内容降级为 invalid，
 		// 保证管理台与可用性判断一致；仍有一个 valid 副本的内容不受影响。
@@ -277,20 +285,33 @@ func (d *DB) MarkLocationError(ctx context.Context, relativePath, errorZh string
 // MarkInvalidNow 立即把一个位置标记为 invalid（事件确认文件消失）。
 // invalid_since 用 COALESCE 保证只在第一次进入 invalid 时写入，重复标记不刷新；
 // now 由调用方注入（协调器时钟），保证 24 小时边界测试确定。
-func (d *DB) MarkInvalidNow(ctx context.Context, relativePath, errorZh string, now time.Time) error {
+// MarkInvalidNow 立即把一个位置标记为 invalid（事件确认文件消失）。
+// invalid_since 用 COALESCE 保证只在第一次进入 invalid 时写入；
+// ExpectedRevision 是调用方任务持有的版本，CAS 不命中返回 ErrRevisionStale，
+// 防止旧 worker 覆盖新任务已提交的状态（阻断 1）。
+// now 由调用方注入（协调器时钟），保证 24 小时边界测试确定。
+func (d *DB) MarkInvalidNow(ctx context.Context, relativePath, errorZh string,
+	now time.Time, expectedRevision int64) error {
+
 	_, err := call(ctx, d.exec, func(ctx context.Context, db *sql.DB) (struct{}, error) {
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return struct{}{}, err
 		}
 		defer tx.Rollback()
-		if _, err := tx.ExecContext(ctx,
+		result, err := tx.ExecContext(ctx,
 			`UPDATE file_locations SET state = 'invalid',
 			    invalid_since = coalesce(invalid_since, ?),
 			    last_error_zh = ?
-			 WHERE relative_path = ?`,
-			now.UnixNano(), errorZh, relativePath); err != nil {
+			 WHERE relative_path = ? AND revision = ?`,
+			now.UnixNano(), errorZh, relativePath, expectedRevision)
+		if err != nil {
 			return struct{}{}, err
+		}
+		if affected, affectedErr := result.RowsAffected(); affectedErr != nil {
+			return struct{}{}, affectedErr
+		} else if affected == 0 {
+			return struct{}{}, ErrRevisionStale
 		}
 		// 同步内容级状态：失去最后一个 valid 副本时降级为 invalid。
 		if _, err := tx.ExecContext(ctx,
@@ -301,35 +322,136 @@ func (d *DB) MarkInvalidNow(ctx context.Context, relativePath, errorZh string, n
 			now.UnixNano()); err != nil {
 			return struct{}{}, err
 		}
+		// 文件确认消失：其未完成的索引任务一并作废。
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM index_jobs WHERE relative_path = ?`, relativePath); err != nil {
+			return struct{}{}, err
+		}
 		return struct{}{}, tx.Commit()
 	})
 	return err
 }
 
-// PrepareIndex 在任务进入 Hash 队列时调用：
-// 把位置转为 indexing、revision 加一并返回新值。
-// 该 revision 是本次任务提交时的 CAS 凭据；期间任何新事件都会再次加一，
-// 使旧任务的 CommitSeedResult 以 ErrRevisionStale 失败。
+// TargetFingerprint 是调度任务时观察到的目标文件指纹；
+// PrepareIndex 用它判断“是否是同一个未完成任务的重复调度”。
+type TargetFingerprint struct {
+	SizeBytes int64
+	MtimeNs   int64
+	DeviceID  *int64
+	Inode     *int64
+}
+
+// nullAsInt64 把 SQL NULL 视作 0，参与指纹比较。
+func nullAsInt64(v any) int64 {
+	switch t := v.(type) {
+	case int64:
+		return t
+	default:
+		return 0
+	}
+}
+
+func (f TargetFingerprint) equal(size, mtime int64, dev, ino any) bool {
+	if f.SizeBytes != size || f.MtimeNs != mtime {
+		return false
+	}
+	return nullAsInt64(nullInt64(f.DeviceID)) == nullAsInt64(dev) &&
+		nullAsInt64(nullInt64(f.Inode)) == nullAsInt64(ino)
+}
+
+// PrepareIndex 在任务进入 Hash 队列时调用，返回本次任务的 revision（CAS 凭据）。
+//
+// 去重规则（阻断 1 活锁修复）：同一文件、同一目标指纹、非强制的重复调度只刷新
+// index_jobs 时间戳并沿用现有 revision——大文件 Hash 超过扫描间隔时，
+// 周期扫描不会再推进 revision 打掉在途任务。
+// 只有以下情况才推进 revision 并把位置置为 indexing：
+//   - force=true（watcher 事件 / 标脏重建：内容可能已变化）；
+//   - 目标指纹与在途任务不同（文件确实变了）；
+//   - 该路径尚无任务或位置行。
+//
 // 同时让失去最后一个 valid 副本的内容立即降级——变更文件在重算完成前必须不可用。
-func (d *DB) PrepareIndex(ctx context.Context, relativePath string, generation int64, now time.Time) (int64, error) {
+func (d *DB) PrepareIndex(ctx context.Context, relativePath string, generation int64,
+	now time.Time, fp TargetFingerprint, force bool) (int64, error) {
+
+	forceFlag := 0
+	if force {
+		forceFlag = 1
+	}
 	return call(ctx, d.exec, func(ctx context.Context, db *sql.DB) (int64, error) {
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return 0, err
 		}
 		defer tx.Rollback()
-		var revision int64
+
+		var currentRevision int64
+		var hasLocation bool
 		err = tx.QueryRowContext(ctx,
-			`INSERT INTO file_locations(relative_path, seed_hash, size_bytes, mtime_ns, state,
-			    invalid_since, last_seen_generation, revision, last_error_zh)
-			 VALUES (?, NULL, 0, 0, 'indexing', NULL, 0, 1, '')
-			 ON CONFLICT(relative_path) DO UPDATE SET
-			   revision = file_locations.revision + 1,
-			   state = 'indexing'
-			 RETURNING revision`, relativePath).Scan(&revision)
-		if err != nil {
-			return 0, fmt.Errorf("准备索引任务 %s 失败: %w", relativePath, err)
+			`SELECT revision FROM file_locations WHERE relative_path = ?`, relativePath).Scan(&currentRevision)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			hasLocation = false
+		case err != nil:
+			return 0, fmt.Errorf("查询位置 %s 失败: %w", relativePath, err)
+		default:
+			hasLocation = true
 		}
+
+		// 已有同指纹的非强制任务：只刷新时间戳，revision 不变。
+		if !force {
+			var size, mtime int64
+			var dev, ino sql.NullInt64
+			jobErr := tx.QueryRowContext(ctx,
+				`SELECT size_bytes, mtime_ns, device_id, inode FROM index_jobs WHERE relative_path = ?`,
+				relativePath).Scan(&size, &mtime, &dev, &ino)
+			hasJob := jobErr == nil
+			if jobErr != nil && !errors.Is(jobErr, sql.ErrNoRows) {
+				return 0, jobErr
+			}
+			if hasJob && fp.equal(size, mtime, dev.Int64, ino.Int64) {
+				if _, err := tx.ExecContext(ctx,
+					`UPDATE index_jobs SET updated_at = ? WHERE relative_path = ?`,
+					now.UnixNano(), relativePath); err != nil {
+					return 0, err
+				}
+				return currentRevision, tx.Commit()
+			}
+		}
+
+		// 记录/更新任务目标指纹。
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO index_jobs(relative_path, size_bytes, mtime_ns, device_id, inode, forced, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(relative_path) DO UPDATE SET
+			   size_bytes = excluded.size_bytes,
+			   mtime_ns = excluded.mtime_ns,
+			   device_id = excluded.device_id,
+			   inode = excluded.inode,
+			   forced = excluded.forced,
+			   updated_at = excluded.updated_at`,
+			relativePath, fp.SizeBytes, fp.MtimeNs, nullInt64(fp.DeviceID), nullInt64(fp.Inode),
+			forceFlag, now.UnixNano()); err != nil {
+			return 0, fmt.Errorf("记录索引任务 %s 失败: %w", relativePath, err)
+		}
+
+		var newRevision int64
+		if hasLocation {
+			if err := tx.QueryRowContext(ctx,
+				`UPDATE file_locations SET state = 'indexing', revision = revision + 1
+				 WHERE relative_path = ? RETURNING revision`, relativePath).Scan(&newRevision); err != nil {
+				return 0, fmt.Errorf("准备索引任务 %s 失败: %w", relativePath, err)
+			}
+		} else {
+			// 新文件：创建 indexing 占位行（无 seed_hash，不会对 MSFile 可见）。
+			newRevision = 1
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO file_locations(relative_path, seed_hash, size_bytes, mtime_ns, state,
+				    invalid_since, last_seen_generation, revision, last_error_zh)
+				 VALUES (?, NULL, 0, 0, 'indexing', NULL, 0, 1, '')`, relativePath); err != nil {
+				return 0, fmt.Errorf("创建索引占位 %s 失败: %w", relativePath, err)
+			}
+		}
+
 		// 旧内容立即不可用：该位置不再是 valid 副本。
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE contents SET state = 'invalid', updated_at = ?
@@ -340,25 +462,39 @@ func (d *DB) PrepareIndex(ctx context.Context, relativePath string, generation i
 			return 0, err
 		}
 		_ = generation
-		return revision, tx.Commit()
+		return newRevision, tx.Commit()
 	})
 }
 
 // SetLocationFailed 记录一个位置的处理失败状态；位置行不存在时创建占位行，
 // 用于“超过协议最大源文件尺寸”等需要在管理台中文展示的情况。
 // 该行没有 seed_hash，不会对 MSFile 可见。
-func (d *DB) SetLocationFailed(ctx context.Context, relativePath string, sizeBytes, mtimeNs int64, errorZh string) error {
+// SetLocationFailed 记录一个位置的处理失败状态；位置行不存在时创建占位行，
+// 用于“超过协议最大源文件尺寸”等需要在管理台中文展示的情况。
+// 该行没有 seed_hash，不会对 MSFile 可见。ExpectedRevision CAS 与 MarkInvalidNow 一致。
+func (d *DB) SetLocationFailed(ctx context.Context, relativePath string, sizeBytes, mtimeNs int64,
+	errorZh string, expectedRevision int64) error {
+
 	_, err := call(ctx, d.exec, func(ctx context.Context, db *sql.DB) (struct{}, error) {
-		_, err := db.ExecContext(ctx,
-			`INSERT INTO file_locations(relative_path, seed_hash, size_bytes, mtime_ns, state, last_error_zh)
-			 VALUES (?, NULL, ?, ?, 'error', ?)
+		result, err := db.ExecContext(ctx,
+			`INSERT INTO file_locations(relative_path, seed_hash, size_bytes, mtime_ns, state, revision, last_error_zh)
+			 VALUES (?, NULL, ?, ?, 'error', 1, ?)
 			 ON CONFLICT(relative_path) DO UPDATE SET
 			   size_bytes = excluded.size_bytes,
 			   mtime_ns = excluded.mtime_ns,
 			   state = 'error',
-			   last_error_zh = excluded.last_error_zh`,
-			relativePath, sizeBytes, mtimeNs, errorZh)
-		return struct{}{}, err
+			   last_error_zh = excluded.last_error_zh
+			 WHERE file_locations.revision = ?`,
+			relativePath, sizeBytes, mtimeNs, errorZh, expectedRevision)
+		if err != nil {
+			return struct{}{}, err
+		}
+		if affected, affectedErr := result.RowsAffected(); affectedErr != nil {
+			return struct{}{}, affectedErr
+		} else if affected == 0 {
+			return struct{}{}, ErrRevisionStale
+		}
+		return struct{}{}, nil
 	})
 	return err
 }
@@ -459,6 +595,12 @@ func (d *DB) CommitSeedResult(ctx context.Context, p CommitParams, now time.Time
 			   AND NOT EXISTS (SELECT 1 FROM file_locations f
 			                   WHERE f.seed_hash = contents.seed_hash AND f.state = 'valid')`,
 			now.UnixNano()); err != nil {
+			return struct{}{}, err
+		}
+
+		// 任务完成：清除目标指纹记录。
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM index_jobs WHERE relative_path = ?`, p.RelativePath); err != nil {
 			return struct{}{}, err
 		}
 		return struct{}{}, tx.Commit()
@@ -927,4 +1069,63 @@ func (d *DB) AllContentHashes(ctx context.Context) (map[string]struct{}, error) 
 		}
 		return out, rows.Err()
 	})
+}
+
+// MarkContentError 在 Seed 文件缺失或完整性失败时调用：
+// 事务内把内容置为 error，后续 Stat 立即返回 absent（阻断 2）。
+func (d *DB) MarkContentError(ctx context.Context, seedHash, reasonZh string, now time.Time) error {
+	_, err := call(ctx, d.exec, func(ctx context.Context, db *sql.DB) (struct{}, error) {
+		_, err := db.ExecContext(ctx,
+			`UPDATE contents SET state = 'error', updated_at = ? WHERE seed_hash = ?`,
+			now.UnixNano(), seedHash)
+		return struct{}{}, err
+	})
+	return err
+}
+
+// LocationsOfSeed 返回该 Seed 当前全部非 indexing 位置的相对路径，
+// 供 Seed 损坏后调度重建使用。
+func (d *DB) LocationsOfSeed(ctx context.Context, seedHash string) ([]string, error) {
+	return call(ctx, d.exec, func(ctx context.Context, db *sql.DB) ([]string, error) {
+		rows, err := db.QueryContext(ctx,
+			`SELECT relative_path FROM file_locations
+			 WHERE seed_hash = ? AND state IN ('valid','invalid','error')`, seedHash)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var p string
+			if err := rows.Scan(&p); err != nil {
+				return nil, err
+			}
+			out = append(out, p)
+		}
+		return out, rows.Err()
+	})
+}
+
+// RecoverStaleIndexing 在服务启动时调用（阻断 1 配套）：
+// 上次进程中断可能把位置留在 indexing 且其 index_jobs 目标已不可信。
+// 处理方式：清空全部任务记录，把 indexing 位置转为 invalid——
+// 下一轮全量扫描中指纹一致者自动确认复用，变化者重新计算。
+func (d *DB) RecoverStaleIndexing(ctx context.Context, now time.Time) error {
+	_, err := call(ctx, d.exec, func(ctx context.Context, db *sql.DB) (struct{}, error) {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return struct{}{}, err
+		}
+		defer tx.Rollback()
+		if _, err := tx.ExecContext(ctx, `DELETE FROM index_jobs`); err != nil {
+			return struct{}{}, err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE file_locations SET state = 'invalid', last_error_zh = ?
+			 WHERE state = 'indexing'`, "进程中断，上次索引任务作废"); err != nil {
+			return struct{}{}, err
+		}
+		return struct{}{}, tx.Commit()
+	})
+	return err
 }

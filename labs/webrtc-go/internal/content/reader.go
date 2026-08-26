@@ -66,10 +66,15 @@ type StatInfo struct {
 	MediaType string // MIME 类型
 }
 
-// DirtyListener 接收读取过程中的位置标脏事件：
-// 完整性失败后由协调器把该位置标脏并安排重新索引。
+// DirtyListener 接收读取过程中的标脏事件（阻断 2）：
+//   - MarkSeedDirty：Seed 文件缺失或完整性失败——协调器必须立即把内容置为
+//     error（Stat 转为 absent）并调度全部原文件位置强制重建；
+//   - MarkLocationDirty：单个原文件位置读取或校验失败——标脏该位置并重索引。
+//
+// 不再使用“空路径表示 Seed 损坏”的隐式约定。
 type DirtyListener interface {
-	MarkDirty(relativePath, reasonZh string)
+	MarkSeedDirty(seedHashHex, reasonZh string)
+	MarkLocationDirty(relativePath, reasonZh string)
 }
 
 // Reader 是 MSFile 服务端的内容真值入口。
@@ -123,12 +128,14 @@ func (r *Reader) ReadSeed(ctx context.Context, seedHashHex string) ([]byte, erro
 	data, err := r.store.ReadSeed(strings.ToLower(seedHashHex))
 	if err != nil {
 		switch {
-		case errors.Is(err, seed.ErrIntegrity):
-			// Seed 文件被破坏：报告标脏以便重建，但绝不返回坏字节。
-			r.markDirty("", "Seed 文件完整性校验失败，需要重新索引")
+		case errors.Is(err, seed.ErrIntegrity), errors.Is(err, seed.ErrNotFound):
+			// Seed 缺失或损坏：通知协调器把内容置为 error 并强制重建；
+			// 绝不返回坏字节，也绝不让 Stat 继续声称 available。
+			r.markSeedDirty(strings.ToLower(seedHashHex), "Seed 文件缺失或完整性校验失败")
+			if errors.Is(err, seed.ErrNotFound) {
+				return nil, ErrContentNotFound
+			}
 			return nil, ErrIntegrity
-		case errors.Is(err, seed.ErrNotFound):
-			return nil, ErrContentNotFound
 		default:
 			return nil, err
 		}
@@ -154,7 +161,7 @@ func (r *Reader) ReadBlock(ctx context.Context, blockHashHex string) ([]byte, er
 			return data, nil
 		}
 		lastErr = readErr
-		r.markDirty(candidate.RelativePath, "块读取或校验失败："+readErr.Error())
+		r.markLocationDirty(candidate.RelativePath, "块读取或校验失败："+readErr.Error())
 	}
 	if errors.Is(lastErr, ErrIntegrity) || isIntegrityCause(lastErr) {
 		return nil, ErrIntegrity
@@ -173,9 +180,15 @@ func (r *Reader) Resolve(ctx context.Context, hashHex string) ([]byte, error) {
 	return r.ReadBlock(ctx, hashHex)
 }
 
-func (r *Reader) markDirty(relativePath, reasonZh string) {
+func (r *Reader) markSeedDirty(seedHashHex, reasonZh string) {
 	if r.dirty != nil {
-		r.dirty.MarkDirty(relativePath, reasonZh)
+		r.dirty.MarkSeedDirty(seedHashHex, reasonZh)
+	}
+}
+
+func (r *Reader) markLocationDirty(relativePath, reasonZh string) {
+	if r.dirty != nil {
+		r.dirty.MarkLocationDirty(relativePath, reasonZh)
 	}
 }
 

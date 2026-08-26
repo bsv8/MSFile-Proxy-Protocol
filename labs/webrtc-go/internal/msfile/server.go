@@ -42,11 +42,13 @@ var _ ContentSource = (*content.Reader)(nil)
 // Limits 是资源上限。public 模式下攻击者可不断生成新公钥，
 // 因此限额必须是跨连接的全局值，不能按公钥或连接划分。
 type Limits struct {
-	MaxConcurrentReads  int           // 全局同时执行的 Read 任务上限
-	MaxInflightRequests int           // 全局在途请求 goroutine 硬上限（含 Stat）
-	MaxInflightPerConn  int           // 单 connection 在途请求上限
-	ReadQueueTimeout    time.Duration // 等待读取槽位的最长时间；超时返回 rate_limited
-	RequestReadTimeout  time.Duration // 单个请求 Frame 的读取 deadline（防半包挂死）
+	MaxConcurrentReads     int           // 全局同时执行的 Read 任务上限
+	MaxInflightRequests    int           // 全局在途请求 goroutine 硬上限（含 Stat）
+	MaxInflightPerConn     int           // 单 connection 在途请求上限
+	ReadQueueTimeout       time.Duration // 等待读取槽位的最长时间；超时返回 rate_limited
+	RequestReadTimeout     time.Duration // 单个请求 Frame 的读取 deadline（防半包挂死）
+	GlobalWriteBytesPerSec int64         // 全局响应带宽上限（字节/秒）；0 = 不限
+	ConnWriteBytesPerSec   int64         // 单 connection 响应带宽上限（字节/秒）；0 = 不限
 }
 
 // DefaultLimits 返回保守默认值：
@@ -54,11 +56,13 @@ type Limits struct {
 // 在途请求总量 256、单连接 64，杜绝无界 goroutine 增长。
 func DefaultLimits() Limits {
 	return Limits{
-		MaxConcurrentReads:  16,
-		MaxInflightRequests: 256,
-		MaxInflightPerConn:  64,
-		ReadQueueTimeout:    10 * time.Second,
-		RequestReadTimeout:  5 * time.Minute,
+		MaxConcurrentReads:     16,
+		MaxInflightRequests:    256,
+		MaxInflightPerConn:     64,
+		ReadQueueTimeout:       10 * time.Second,
+		RequestReadTimeout:     5 * time.Minute,
+		GlobalWriteBytesPerSec: 256 << 20, // 256 MiB/s：功能上强制限流存在，吞吐对内网足够
+		ConnWriteBytesPerSec:   32 << 20,  // 32 MiB/s
 	}
 }
 
@@ -122,13 +126,14 @@ func (cs *connState) releaseRole(kind uint64) {
 
 // Server 是正式 MSFile 文件服务端。
 type Server struct {
-	host     host.Host
-	reader   ContentSource
-	policy   *auth.Policy
-	log      *metrics.Logger
-	limits   Limits
-	readSem  chan struct{}
-	inflight atomic.Int32
+	host         host.Host
+	reader       ContentSource
+	policy       *auth.Policy
+	log          *metrics.Logger
+	limits       Limits
+	readSem      chan struct{}
+	inflight     atomic.Int32
+	globalBucket *rateBucket
 
 	connMu sync.Mutex
 	conns  map[string]*connState
@@ -233,55 +238,64 @@ func (s *Server) handleStream(stream network.Stream) {
 	}
 
 	// stream 生命周期 ctx：读循环结束或 writer 失败时取消全部在途任务。
+	// 角色占用先于序号推进（阻断 4）：认证 → claimRole → advance → 业务。
+	// 重复 stream 用更大 ID 无法烧掉合法 stream 的序号空间，
+	// 第一帧过期的 ID 也无法绕过“每 connection 一条同角色 stream”约束。
+	if !cs.claimRole(first.Kind) {
+		responses := make(chan response, 1)
+		writerDone := make(chan error, 1)
+		go s.writeResponses(stream, responses, writerDone, func() {}, nil)
+		responses <- response{fields: Error(first.Kind, first.ID, "wrong_stream_role", "当前连接已经存在同角色 stream", 0)}
+		close(responses)
+		if err := <-writerDone; err != nil {
+			_ = stream.Reset()
+		} else {
+			s.gracefulClose(stream)
+		}
+		return
+	}
+	defer cs.releaseRole(first.Kind)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	responses := make(chan response, 32)
 	writerDone := make(chan error, 1)
-	go s.writeResponses(stream, responses, writerDone, cancel)
+	connBucket := newRateBucket(s.limits.ConnWriteBytesPerSec)
+	go s.writeResponses(stream, responses, writerDone, cancel, connBucket)
 	var workers sync.WaitGroup
 	var pendingMu sync.Mutex
 	pending := make(map[string]*pendingRead)
 
-	firstConsumed := false
 	handle := func(request Request) bool {
 		if request.Kind != first.Kind {
 			responses <- response{fields: Error(request.Kind, request.ID, "wrong_stream_role", "Stat 与 Read 必须使用不同 stream", 0)}
 			return false
 		}
-		if !firstConsumed {
-			// 首帧：序号推进失败是逐请求错误（stale_request_id），流继续；
-			// 角色占用失败才是流级错误（wrong_stream_role），终止读循环。
-			if !cs.advance(first.Kind, first.ID) {
-				responses <- response{fields: Error(first.Kind, first.ID, "stale_request_id",
-					"request ID 必须在当前 connection 内递增，重建 stream 也不得倒退", 0)}
-				firstConsumed = true
-				return true
-			}
-			if !cs.claimRole(first.Kind) {
-				responses <- response{fields: Error(first.Kind, first.ID, "wrong_stream_role", "当前连接已经存在同角色 stream", 0)}
-				return false
-			}
-			defer cs.releaseRole(first.Kind)
-			firstConsumed = true
-		} else if !cs.advance(request.Kind, request.ID) {
-			responses <- response{fields: Error(request.Kind, request.ID, "stale_request_id", "request ID 必须在当前 connection 内递增", 0)}
+		// 角色已在外部占用（认证 → claimRole → defer release）。
+		// 序号推进失败是逐请求错误（stale_request_id），流继续服务后续请求。
+		if !cs.advance(request.Kind, request.ID) {
+			responses <- response{fields: Error(request.Kind, request.ID, "stale_request_id", "request ID 必须在当前 connection 内递增，重建 stream 也不得倒退", 0)}
 			return true
 		}
 
-		// 在途请求硬上限：全局与单连接双层。
-		if s.inflight.Load() >= int32(s.limits.MaxInflightRequests) || cs.inflightExceeds(s.limits.MaxInflightPerConn) {
+		// 在途请求硬上限：全局 CAS + 单连接同临界区检查并自增（阻断 4）。
+		globalOK := s.tryAddInflight()
+		if !globalOK {
 			responses <- response{fields: Error(request.Kind, request.ID, "rate_limited", "在途请求达到上限，请稍后重试", retryAfterMs())}
 			return true
 		}
-		s.inflight.Add(1)
-		cs.inflightAdd(1)
+		if !cs.tryInflightAdd(s.limits.MaxInflightPerConn) {
+			s.inflight.Add(-1)
+			responses <- response{fields: Error(request.Kind, request.ID, "rate_limited", "当前连接在途请求达到上限，请稍后重试", retryAfterMs())}
+			return true
+		}
 
 		if request.Kind == KindStatRequest {
 			workers.Add(1)
 			go func() {
 				defer workers.Done()
-				defer func() { s.inflight.Add(-1); cs.inflightAdd(-1) }()
+				defer func() { s.inflight.Add(-1); cs.inflightDone() }()
 				s.handleStat(ctx, request, responses)
 			}()
 			return true
@@ -299,7 +313,7 @@ func (s *Server) handleStream(stream network.Stream) {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			defer func() { s.inflight.Add(-1); cs.inflightAdd(-1) }()
+			defer func() { s.inflight.Add(-1); cs.inflightDone() }()
 			s.handleRead(request, current, responses, func() {
 				pendingMu.Lock()
 				if pending[hash] == current {
@@ -328,26 +342,8 @@ func (s *Server) handleStream(stream network.Stream) {
 	if werr := <-writerDone; werr != nil {
 		_ = stream.Reset()
 	} else {
-		// 先半关写方向；随后等待对端读完剩余数据并关闭（或有界超时），
-		// 再全关流。立即 Close 在部分 muxer 实现上可能把未读取的字节连同
-		// 接收缓冲一起丢弃，造成客户端只看到 FIN 而丢失最后一个 Frame。
-		_ = stream.CloseWrite()
-		drained := make(chan struct{})
-		go func() {
-			defer close(drained)
-			buf := make([]byte, 512)
-			for {
-				if _, err := stream.Read(buf); err != nil {
-					return
-				}
-			}
-		}()
-		select {
-		case <-drained:
-		case <-time.After(3 * time.Second):
-		case <-s.stopCh:
-		}
-		_ = stream.Close()
+		// 优雅关闭：半关 + 等待对端读完（有界），避免丢最后一帧。
+		s.gracefulClose(stream)
 	}
 }
 
@@ -423,6 +419,57 @@ func (s *Server) handleRead(request Request, pending *pendingRead, out chan<- re
 	send(queueCtx, out, response{fields: ReadSuccess(request.ID, request.Hash, int64(len(data))), data: data, done: done})
 }
 
+// tryAddInflight 以 CAS 循环原子地占用一个全局在途槽位（阻断 4）。
+func (s *Server) tryAddInflight() bool {
+	for {
+		current := s.inflight.Load()
+		if current >= int32(s.limits.MaxInflightRequests) {
+			return false
+		}
+		if s.inflight.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
+}
+
+// tryInflightAdd 在同一临界区内完成检查与自增；满则返回 false 且无任何变更。
+func (c *connState) tryInflightAdd(limit int) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.inflight >= limit {
+		return false
+	}
+	c.inflight++
+	return true
+}
+
+func (c *connState) inflightDone() {
+	c.mu.Lock()
+	c.inflight--
+	c.mu.Unlock()
+}
+
+// gracefulClose 半关写方向、等待对端读完或有界超时后全关。
+func (s *Server) gracefulClose(stream network.Stream) {
+	_ = stream.CloseWrite()
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		buf := make([]byte, 512)
+		for {
+			if _, err := stream.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+	select {
+	case <-drained:
+	case <-time.After(3 * time.Second):
+	case <-s.stopCh:
+	}
+	_ = stream.Close()
+}
+
 // readErrorCode 把 content.Reader 的错误映射为协议稳定错误码；消息保持中文诊断。
 func readErrorCode(err error) (string, string) {
 	switch {
@@ -451,7 +498,19 @@ func send(ctx context.Context, out chan<- response, value response) {
 
 // writeResponses 是该 stream 唯一的 Frame writer：串行写完整 Header + attachment。
 // 写失败即触发 cancel，终止该 stream 上所有在途任务，避免半写 Frame 后继续消耗资源。
-func (s *Server) writeResponses(stream network.Stream, responses <-chan response, done chan<- error, cancel context.CancelFunc) {
+func (s *Server) writeResponses(stream network.Stream, responses <-chan response,
+	done chan<- error, cancel context.CancelFunc, connBucket *rateBucket) {
+
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	go func() {
+		select {
+		case <-s.stopCh:
+			cancel()
+			stop()
+		case <-ctx.Done():
+		}
+	}()
 	for value := range responses {
 		if err := stream.SetWriteDeadline(time.Now().Add(5 * time.Minute)); err != nil {
 			finishResponse(&value)
@@ -460,8 +519,13 @@ func (s *Server) writeResponses(stream network.Stream, responses <-chan response
 			return
 		}
 		var attachment io.Reader
-		if value.data != nil {
-			attachment = &byteSliceReader{data: value.data}
+		if value.data != nil && len(value.data) > 0 {
+			attachment = &throttledReader{
+				r:      &byteSliceReader{data: value.data},
+				global: s.globalBucket,
+				conn:   connBucket,
+				ctx:    ctx,
+			}
 		}
 		err := WriteFrame(stream, value.fields, attachment, int64(len(value.data)))
 		finishResponse(&value)
@@ -500,4 +564,82 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// ---------- 带宽令牌桶（需求 §9/§10：public 必须有带宽上限） ----------
+
+// rateBucket 是惰性补充的令牌桶；rate<=0 表示不限速。
+type rateBucket struct {
+	mu     sync.Mutex
+	rate   float64 // 字节/秒
+	tokens float64
+	last   time.Time
+}
+
+func newRateBucket(bytesPerSec int64) *rateBucket {
+	if bytesPerSec <= 0 {
+		return nil
+	}
+	return &rateBucket{rate: float64(bytesPerSec), tokens: float64(bytesPerSec), last: time.Now()}
+}
+
+// take 阻塞直到获取 n 个字节的配额；ctx 取消时提前返回。
+func (b *rateBucket) take(ctx context.Context, n int) error {
+	if b == nil {
+		return nil
+	}
+	for n > 0 {
+		b.mu.Lock()
+		now := time.Now()
+		elapsed := now.Sub(b.last).Seconds()
+		b.last = now
+		b.tokens += elapsed * b.rate
+		if max := b.rate; b.tokens > max {
+			b.tokens = max // 桶容量 = 1 秒突发
+		}
+		grant := b.tokens
+		if grant > float64(n) {
+			grant = float64(n)
+		}
+		if grant >= 1 {
+			b.tokens -= grant
+			b.mu.Unlock()
+			n -= int(grant)
+			continue
+		}
+		// 计算补足剩余字节需要的等待时间后让出。
+		need := float64(n) - b.tokens
+		wait := time.Duration(need / b.rate * float64(time.Second))
+		b.mu.Unlock()
+		if wait < time.Millisecond {
+			wait = time.Millisecond
+		}
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+// throttledReader 在读取 attachment 字节流时同步消耗全局与单连接配额。
+type throttledReader struct {
+	r      io.Reader
+	global *rateBucket
+	conn   *rateBucket
+	ctx    context.Context
+}
+
+func (t *throttledReader) Read(p []byte) (int, error) {
+	if len(p) > 16<<10 {
+		p = p[:16<<10] // 与协议建议一致的分片粒度，防止单次长阻塞
+	}
+	if err := t.global.take(t.ctx, len(p)); err != nil {
+		return 0, err
+	}
+	if err := t.conn.take(t.ctx, len(p)); err != nil {
+		return 0, err
+	}
+	return t.r.Read(p)
 }

@@ -44,9 +44,13 @@ type Root struct {
 	ino   uint64
 }
 
-// Open 建立绑定 dir 的安全根。
+// Open 建立绑定 dir 的安全根。目录暂时不存在（挂载未就绪，degraded 启动）时
+// 返回可用的惰性 Root：目录出现后的首次访问会自动建立底层句柄。
 func Open(dir string) (*Root, error) {
 	r := &Root{dir: dir}
+	if _, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) {
+		return r, nil // 惰性：inner 为空，ensure 时再建
+	}
 	if err := r.reopen(); err != nil {
 		return nil, err
 	}
@@ -55,6 +59,9 @@ func Open(dir string) (*Root, error) {
 
 // reopen 重开底层 os.Root 并记录当前目录 inode；调用方必须持有 mu。
 func (r *Root) reopen() error {
+	if _, err := os.Stat(r.dir); err != nil {
+		return err // 目录仍不可见：保持惰性
+	}
 	inner, err := os.OpenRoot(r.dir)
 	if err != nil {
 		return fmt.Errorf("建立安全根 %s 失败: %w", r.dir, err)
@@ -72,17 +79,24 @@ func (r *Root) reopen() error {
 	return nil
 }
 
-// ensure 检测目录 inode 变化（卸载重挂、删除重建）并在需要时重开；调用方必须持有 mu。
+// ensure 检测目录可见性与 inode 变化（卸载重挂、删除重建、延迟挂载）；
+// 需要时重开或惰性建立底层句柄。调用方必须持有 mu。
 func (r *Root) ensure() error {
 	fi, err := os.Stat(r.dir)
 	if err != nil {
 		return err // 当前不可见：调用方按文件不可见路径处理
 	}
-	if st, ok := fi.Sys().(*syscall.Stat_t); ok && r.inner != nil {
-		if uint64(st.Dev) != r.dev || uint64(st.Ino) != r.ino {
-			_ = r.inner.Close()
-			return r.reopen()
-		}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil
+	}
+	curDev, curIno := uint64(st.Dev), uint64(st.Ino)
+	switch {
+	case r.inner == nil:
+		return r.reopen()
+	case curDev != r.dev || curIno != r.ino:
+		_ = r.inner.Close()
+		return r.reopen()
 	}
 	return nil
 }
@@ -140,6 +154,9 @@ func (r *Root) OpenFile(rel string) (*os.File, fs.FileInfo, error) {
 	if err := r.ensure(); err != nil {
 		return nil, nil, err
 	}
+	if r.inner == nil {
+		return nil, nil, fmt.Errorf("nas_data 尚未就绪：%w", fs.ErrNotExist)
+	}
 	file, err := r.inner.Open(cleaned)
 	if err != nil {
 		return nil, nil, err
@@ -167,6 +184,9 @@ func (r *Root) LstatFile(rel string) (fs.FileInfo, error) {
 	defer r.mu.Unlock()
 	if err := r.ensure(); err != nil {
 		return nil, err
+	}
+	if r.inner == nil {
+		return nil, fmt.Errorf("nas_data 尚未就绪：%w", fs.ErrNotExist)
 	}
 	for i := 1; i < len(parts(cleaned)); i++ {
 		fi, err := os.Lstat(filepath.Join(r.dir, strings.Join(parts(cleaned)[:i], "/")))

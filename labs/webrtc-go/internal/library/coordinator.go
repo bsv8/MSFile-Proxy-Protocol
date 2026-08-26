@@ -75,6 +75,15 @@ type IndexJob struct {
 	Generation   int64
 }
 
+// queuedTask 是去重队列里的待处理项：fp/force 在出队时传给 PrepareIndex。
+// 同路径重复入队时 generation 取最大、force 取或。
+type queuedTask struct {
+	path  string
+	gen   int64
+	fp    indexdb.TargetFingerprint
+	force bool
+}
+
 // Coordinator 统一管理扫描、事件、稳定性检测、Hash worker、提交与 GC 生命周期。
 // revision 的唯一真值在 SQLite；内存只保留去重队列与重试计数。
 type Coordinator struct {
@@ -88,7 +97,7 @@ type Coordinator struct {
 	root    *safefs.Root // nas_data 安全打开入口：Hash/stat 全部经由它
 
 	mu       sync.Mutex
-	pending  []string            // 有界 FIFO 去重队列（仅存路径）
+	pending  []queuedTask        // 有界 FIFO 去重队列
 	pendingG map[string]int64    // 路径 -> 触发 generation（同路径取最大）
 	inQueue  map[string]struct{} // 去重集合
 	attempts map[string]int      // 连续失败计数（运维诊断，不参与正确性）
@@ -112,11 +121,10 @@ type Coordinator struct {
 
 // New 创建协调器；调用 Start 前不会启动任何 goroutine。
 // New 创建协调器；失败时返回中文错误，调用方无需回滚。
-func New(cfg *config.Config, db *indexdb.DB, store *seed.Store, log *metrics.Logger) (*Coordinator, error) {
-	root, err := safefs.Open(cfg.NASData)
-	if err != nil {
-		return nil, err
-	}
+// New 创建协调器；root 由组合根创建并共享给内容读取器，停止时统一关闭。
+func New(cfg *config.Config, db *indexdb.DB, store *seed.Store, log *metrics.Logger,
+	root *safefs.Root) (*Coordinator, error) {
+
 	return &Coordinator{
 		cfg:      cfg,
 		db:       db,
@@ -186,7 +194,17 @@ func (c *Coordinator) Stop() {
 			c.cancel()
 		}
 	})
-	c.wg.Wait()
+	// 有界等待：网络挂载读可能永久阻塞，不能让 Stop 无限期挂起；
+	// ctx 取消已通知全部 goroutine，超时后仅记录中文诊断。
+	waitCh := make(chan struct{})
+	go func() { c.wg.Wait(); close(waitCh) }()
+	select {
+	case <-waitCh:
+	case <-time.After(10 * time.Second):
+		c.log.Emit("library_stop_timeout", map[string]any{
+			"reason_zh": "停止等待超时（可能有阻塞中的文件 IO），后台任务将在 IO 返回后退出",
+		})
+	}
 }
 
 // QueueDepth 返回当前排队路径数，供管理台展示。
@@ -199,11 +217,25 @@ func (c *Coordinator) QueueDepth() int {
 // Scanning 返回是否正在执行全量扫描。
 func (c *Coordinator) Scanning() bool { return c.scanning.Load() }
 
-// SchedulePath 把一个 nas_data 相对路径加入处理队列。
-// generation 是触发扫描批次（事件任务为 0）；同路径重复调度取最大 generation。
-// 真正的 revision 由 dispatcher 调用 SQLite PrepareIndex 时分配，
-// 队列满载时记录中文诊断并触发全量扫描兜底（背压）。
+// SchedulePath 把一个 nas_data 相对路径以强制模式加入处理队列：
+// watcher 事件、标脏重建等“内容可能已变化”的来源使用本入口，
+// 出队后 PrepareIndex 必定推进 revision。
 func (c *Coordinator) SchedulePath(reasonZh string, generation int64, relativePaths ...string) {
+	c.enqueue(reasonZh, generation, indexdb.TargetFingerprint{}, true, relativePaths...)
+}
+
+// ScheduleFromScan 是全量扫描专用入口：携带扫描时观察到的指纹。
+// 同指纹的在途任务不会被重复推进 revision（阻断 1 活锁修复）。
+func (c *Coordinator) ScheduleFromScan(reasonZh string, generation int64,
+	relativePath string, fp indexdb.TargetFingerprint) {
+
+	c.enqueue(reasonZh, generation, fp, false, relativePath)
+}
+
+// enqueue 去重入队；同路径合并 generation（取最大）与 force（取或）。
+func (c *Coordinator) enqueue(reasonZh string, generation int64,
+	fp indexdb.TargetFingerprint, force bool, relativePaths ...string) {
+
 	overflow := false
 	c.mu.Lock()
 	for _, path := range relativePaths {
@@ -215,6 +247,12 @@ func (c *Coordinator) SchedulePath(reasonZh string, generation int64, relativePa
 			c.pendingG[path] = generation
 		}
 		if _, ok := c.inQueue[path]; ok {
+			for i := range c.pending {
+				if c.pending[i].path == path {
+					c.pending[i].force = c.pending[i].force || force
+					break
+				}
+			}
 			continue
 		}
 		if len(c.pending) >= maxPendingPaths {
@@ -222,7 +260,7 @@ func (c *Coordinator) SchedulePath(reasonZh string, generation int64, relativePa
 			break
 		}
 		c.inQueue[path] = struct{}{}
-		c.pending = append(c.pending, path)
+		c.pending = append(c.pending, queuedTask{path: path, gen: generation, fp: fp, force: force})
 	}
 	c.mu.Unlock()
 	select {
@@ -247,14 +285,35 @@ func (c *Coordinator) TriggerFullScan() bool {
 	}
 }
 
-// MarkDirty 实现 content.DirtyListener：
-// 读取完整性失败时把位置标脏并重新调度；空路径表示 Seed 文件损坏，触发全量扫描重建。
-func (c *Coordinator) MarkDirty(relativePath, reasonZh string) {
-	if relativePath == "" {
-		c.log.Emit("library_seed_corrupt", map[string]any{"reason_zh": reasonZh})
+// MarkSeedDirty 实现 content.DirtyListener（阻断 2）：
+// Seed 缺失或损坏时，事务内立即把内容置为 error——后续 Stat 必须返回 absent；
+// 随后以强制模式调度该 Seed 的全部原文件位置重建。
+func (c *Coordinator) MarkSeedDirty(seedHashHex, reasonZh string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.db.MarkContentError(ctx, seedHashHex, reasonZh, c.clk.Now()); err != nil {
+		c.log.Emit("library_seed_mark_error_failed", map[string]any{"seed_hash": seedHashHex, "error": err.Error()})
+	}
+	locations, err := c.db.LocationsOfSeed(ctx, seedHashHex)
+	if err != nil {
+		c.log.Emit("library_seed_relocate_failed", map[string]any{"seed_hash": seedHashHex, "error": err.Error()})
+		return
+	}
+	if len(locations) == 0 {
 		c.TriggerFullScan()
 		return
 	}
+	c.log.Emit("library_seed_dirty", map[string]any{
+		"seed_hash":   seedHashHex,
+		"reason_zh":   reasonZh,
+		"rebuild_cnt": len(locations),
+	})
+	c.SchedulePath("Seed 损坏，从原文件强制重建", 0, locations...)
+}
+
+// MarkLocationDirty 实现 content.DirtyListener：
+// 单个原文件位置读取或校验失败时标脏并强制重索引。
+func (c *Coordinator) MarkLocationDirty(relativePath, reasonZh string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := c.db.MarkLocationError(ctx, relativePath, reasonZh); err != nil {
@@ -271,26 +330,27 @@ func (c *Coordinator) dispatchLoop(ctx context.Context) {
 		case <-c.notifyCh:
 		}
 		for {
-			path, generation, ok := c.popPending()
+			task, ok := c.popPending()
 			if !ok {
 				break
 			}
-			// PrepareIndex：分配本次任务的 revision（CAS 凭据），
-			// 并把位置转为 indexing——旧 Seed Hash 从此刻起立即不可用。
+			// PrepareIndex：分配本次任务的 revision（CAS 凭据）并把位置置为 indexing；
+			// 同指纹的非强制重复调度不会推进 revision（阻断 1 活锁修复）。
 			prepCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			revision, err := c.db.PrepareIndex(prepCtx, path, generation, c.clk.Now())
+			revision, err := c.db.PrepareIndex(prepCtx, task.path, task.gen,
+				c.clk.Now(), task.fp, task.force)
 			cancel()
 			if err != nil {
 				if ctx.Err() == nil {
 					c.log.Emit("library_prepare_failed", map[string]any{
-						"path_zh":   path,
+						"path_zh":   task.path,
 						"error":     err.Error(),
 						"reason_zh": "任务准备失败，等待下一次事件或全量扫描重试",
 					})
 				}
 				continue
 			}
-			job := IndexJob{RelativePath: path, Revision: revision, Generation: generation}
+			job := IndexJob{RelativePath: task.path, Revision: revision, Generation: task.gen}
 			select {
 			case c.jobs <- job:
 			case <-ctx.Done():
@@ -300,21 +360,20 @@ func (c *Coordinator) dispatchLoop(ctx context.Context) {
 	}
 }
 
-func (c *Coordinator) popPending() (string, int64, bool) {
+func (c *Coordinator) popPending() (queuedTask, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for len(c.pending) > 0 {
-		path := c.pending[0]
+		task := c.pending[0]
 		c.pending = c.pending[1:]
-		generation := c.pendingG[path]
-		delete(c.inQueue, path)
-		delete(c.pendingG, path)
-		if path == "" || path == "." {
+		delete(c.inQueue, task.path)
+		delete(c.pendingG, task.path)
+		if task.path == "" || task.path == "." {
 			continue
 		}
-		return path, generation, true
+		return task, true
 	}
-	return "", 0, false
+	return queuedTask{}, false
 }
 
 func (c *Coordinator) workerLoop(ctx context.Context) {
@@ -339,12 +398,12 @@ func (c *Coordinator) processPath(ctx context.Context, job IndexJob) {
 		return
 	}
 	if err != nil {
-		c.retryOrFailWith(ctx, relativePath, job.Generation, fmt.Sprintf("稳定性检测失败：%v", err))
+		c.retryOrFailWith(ctx, job, fmt.Sprintf("稳定性检测失败：%v", err))
 		return
 	}
 	if !ok {
 		// 文件消失：进入 invalid（24 小时保留），不删除任何派生数据。
-		c.handleMissing(ctx, relativePath)
+		c.handleMissing(ctx, relativePath, job.Revision)
 		return
 	}
 	if !before.Mode.IsRegular() {
@@ -358,7 +417,7 @@ func (c *Coordinator) processPath(ctx context.Context, job IndexJob) {
 
 	result, buildErr := c.buildSeed(relativePath)
 	if buildErr != nil {
-		c.retryOrFailWith(ctx, relativePath, job.Generation, buildErr.Error())
+		c.retryOrFailWith(ctx, job, buildErr.Error())
 		return
 	}
 
@@ -372,7 +431,7 @@ func (c *Coordinator) processPath(ctx context.Context, job IndexJob) {
 			"path_zh":   relativePath,
 			"reason_zh": "Hash 期间文件继续变化，丢弃本次结果并重新排队",
 		})
-		c.retryOrFailWith(ctx, relativePath, job.Generation, "文件持续写入，等待稳定后重试")
+		c.retryOrFailWith(ctx, job, "文件持续写入，等待稳定后重试")
 		return
 	}
 
@@ -382,7 +441,7 @@ func (c *Coordinator) processPath(ctx context.Context, job IndexJob) {
 	c.seedLifecycleMu.Lock()
 	if err := c.store.Publish(result); err != nil {
 		c.seedLifecycleMu.Unlock()
-		c.retryOrFailWith(ctx, relativePath, job.Generation, "Seed 发布失败："+err.Error())
+		c.retryOrFailWith(ctx, job, "Seed 发布失败："+err.Error())
 		return
 	}
 	err = c.db.CommitSeedResult(ctx, indexdb.CommitParams{
@@ -403,7 +462,9 @@ func (c *Coordinator) processPath(ctx context.Context, job IndexJob) {
 	c.seedLifecycleMu.Unlock()
 	switch {
 	case err == nil:
+		c.mu.Lock()
 		delete(c.attempts, relativePath)
+		c.mu.Unlock()
 	case errors.Is(err, indexdb.ErrRevisionStale):
 		// 已被更新的调度取代：丢弃本次结果；孤儿 Seed 由 GC 磁盘扫描延迟回收。
 		c.log.Emit("library_revision_stale", map[string]any{
@@ -411,55 +472,57 @@ func (c *Coordinator) processPath(ctx context.Context, job IndexJob) {
 			"reason_zh": "提交时任务已被更新的调度取代，丢弃本次计算结果",
 		})
 	default:
-		c.retryOrFailWith(ctx, relativePath, job.Generation, "SQLite 提交失败："+err.Error())
+		c.retryOrFailWith(ctx, job, "SQLite 提交失败："+err.Error())
 	}
 }
 
 // handleMissing 处理确认消失的文件：位置进入 invalid（第一次进入时记录 invalid_since，
 // 之后重复标记不得刷新），不删除任何派生数据。同时 bump revision 使同路径在途任务失效。
-func (c *Coordinator) handleMissing(ctx context.Context, relativePath string) {
-	if err := c.db.MarkInvalidNow(ctx, relativePath, "文件或目录当前不可见", c.clk.Now()); err != nil {
+func (c *Coordinator) handleMissing(ctx context.Context, relativePath string, revision int64) {
+	err := c.db.MarkInvalidNow(ctx, relativePath, "文件或目录当前不可见", c.clk.Now(), revision)
+	if err != nil && !errors.Is(err, indexdb.ErrRevisionStale) {
 		c.log.Emit("library_invalidate_failed", map[string]any{"path_zh": relativePath, "error": err.Error()})
 	}
 }
 
 // retryOrFailWith 记录一次失败：未达上限立即重新排队（防抖由稳定性检测承担）；
 // 达到上限后保留 error 状态并停止重试，等待下一次事件或全量扫描。
-func (c *Coordinator) retryOrFailWith(ctx context.Context, relativePath string, generation int64, reasonZh string) {
+func (c *Coordinator) retryOrFailWith(ctx context.Context, job IndexJob, reasonZh string) {
 	c.mu.Lock()
-	attempt := c.attempts[relativePath] + 1
+	attempt := c.attempts[job.RelativePath] + 1
 	giveUp := attempt >= maxAttempts
 	if giveUp {
-		delete(c.attempts, relativePath)
+		delete(c.attempts, job.RelativePath)
 	} else {
-		c.attempts[relativePath] = attempt
+		c.attempts[job.RelativePath] = attempt
 	}
 	c.mu.Unlock()
 
 	if giveUp {
 		var size, mtime int64
-		if fi, err := c.root.LstatFile(relativePath); err == nil {
+		if fi, err := c.root.LstatFile(job.RelativePath); err == nil {
 			size = fi.Size()
 			mtime = fi.ModTime().UnixNano()
 		}
 		dbCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if err := c.db.SetLocationFailed(dbCtx, relativePath, size, mtime, reasonZh); err != nil {
-			c.log.Emit("library_record_error_failed", map[string]any{"path_zh": relativePath, "error": err.Error()})
+		if err := c.db.SetLocationFailed(dbCtx, job.RelativePath, size, mtime, reasonZh, job.Revision); err != nil {
+			c.log.Emit("library_record_error_failed", map[string]any{"path_zh": job.RelativePath, "error": err.Error()})
 		}
 		c.log.Emit("library_path_gave_up", map[string]any{
-			"path_zh":   relativePath,
+			"path_zh":   job.RelativePath,
 			"attempts":  maxAttempts,
 			"reason_zh": reasonZh,
 		})
 		return
 	}
 	c.log.Emit("library_retry_scheduled", map[string]any{
-		"path_zh":   relativePath,
+		"path_zh":   job.RelativePath,
 		"attempt":   attempt,
 		"reason_zh": reasonZh,
 	})
-	c.SchedulePath(reasonZh, generation, relativePath)
+	// 重试属于“内容可能已变化”的强制调度。
+	c.SchedulePath(reasonZh, job.Generation, job.RelativePath)
 }
 
 // buildSeed 通过安全入口打开原文件并流式计算 Seed；不做任何数据库写入。

@@ -137,7 +137,7 @@ func TestConcurrentBumpRevisionSerialized(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < rounds; j++ {
-				if _, err := db.PrepareIndex(bg, path, 0, time.Now()); err != nil { // PrepareIndex 是生产路径的并发 revision 自增入口
+				if _, err := db.PrepareIndex(bg, path, 0, time.Now(), TargetFingerprint{SizeBytes: 1}, true); err != nil { // 强制模式推进 revision
 					errs <- err
 					return
 				}

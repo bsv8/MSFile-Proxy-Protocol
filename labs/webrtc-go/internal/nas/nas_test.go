@@ -7,11 +7,20 @@ package nas
 // 启动顺序本身由 New 的装配路径保证：锁先于数据库，数据库先于监听。
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+
 	"database/sql"
 	"encoding/hex"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
@@ -20,9 +29,17 @@ import (
 	"time"
 
 	"github.com/benbjohnson/clock"
+	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
+	websocket "github.com/libp2p/go-libp2p/p2p/transport/websocket"
+	ma "github.com/multiformats/go-multiaddr"
 	_ "modernc.org/sqlite"
 
 	"msfile.dev/labs/webrtc-go/internal/config"
+	"msfile.dev/labs/webrtc-go/internal/msfile"
+	"msfile.dev/labs/webrtc-go/internal/seed"
 )
 
 // writeTestKey 写出一个随机但合法的 32 字节 secp256k1 私钥 hex 文件。
@@ -225,4 +242,187 @@ func TestAdminPortConflictRollsEverythingBack(t *testing.T) {
 	if err := again.Shutdown(stopCtx); err != nil {
 		t.Fatalf("二次实例停止失败: %v", err)
 	}
+}
+
+// ---------- 阻断 3：正式配置链路的 WSS 装配 ----------
+
+// TestTLSConfigRequiresExplicitWSSListener：配置了证书却仍写裸 /ws 必须拒绝启动，
+// 证书不会隐式把 /ws 升级为 /tls/ws。
+func TestTLSConfigRequiresExplicitWSSListener(t *testing.T) {
+	cfg := testConfig(t)
+	certFile, keyFile := writeSelfSignedCert(t)
+	cfg.TLSCertFile = certFile
+	cfg.TLSKeyFile = keyFile
+	cfg.ListenAddrs = []string{"/ip4/127.0.0.1/tcp/0/ws"} // 裸 WS + 证书：非法组合
+	if app, err := New(cfg); err == nil {
+		_ = app.Shutdown(mustTimeoutCtx(t))
+		t.Fatal("证书 + 裸 /ws 的组合必须被拒绝")
+	} else if !strings.Contains(err.Error(), "/tls/ws") {
+		t.Fatalf("错误信息必须提示显式改写为 /tls/ws，实际: %v", err)
+	}
+}
+
+// TestFullAssemblyServesStatOverWSS（阻断 3 端到端）：
+// 配置 → nas.New → ServiceMultiaddrs 含 /tls/ws → 客户端经 TLS+Noise+PeerId 完成 Stat。
+func TestFullAssemblyServesStatOverWSS(t *testing.T) {
+	cfg := testConfig(t)
+	certFile, keyFile := writeSelfSignedCert(t)
+	cfg.TLSCertFile = certFile
+	cfg.TLSKeyFile = keyFile
+	cfg.ListenAddrs = []string{"/ip4/127.0.0.1/udp/0/webrtc-direct", "/ip4/127.0.0.1/tcp/0/tls/ws"}
+
+	// 预置一个可提供的内容，让 Stat 有 available 可断言。
+	base := make([]byte, 300000)
+	for i := range base {
+		base[i] = byte(i * 7)
+	}
+	if err := os.MkdirAll(filepath.Join(cfg.NASData), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg.NASData, "wss-e2e.bin"), base, 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	app, err := New(cfg)
+	if err != nil {
+		t.Fatalf("装配失败: %v", err)
+	}
+	shutdownOnce := false
+	defer func() {
+		if !shutdownOnce {
+			_ = app.Shutdown(mustTimeoutCtx(t))
+		}
+	}()
+
+	found := false
+	for _, addr := range ServiceMultiaddrs(app.Host()) {
+		maddr, merr := ma.NewMultiaddr(addr)
+		if merr != nil {
+			continue
+		}
+		hasTLS, hasWS := false, false
+		for _, p := range maddr.Protocols() {
+			switch p.Code {
+			case ma.P_TLS:
+				hasTLS = true
+			case ma.P_WS:
+				hasWS = true
+			}
+		}
+		if hasTLS && hasWS {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ServiceMultiaddrs 应包含 /tls/ws 地址: %v", ServiceMultiaddrs(app.Host()))
+	}
+
+	// 客户端：InsecureSkipVerify（自签），身份认证只能来自 Noise + PeerId pin。
+	clientPriv, _, err := crypto.GenerateSecp256k1Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientPubRaw, err := clientPriv.GetPublic().Raw()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 白名单必须包含该客户端；重启服务以加载白名单。
+	cfg.PublicKeyWhitelist = []string{hex.EncodeToString(clientPubRaw)}
+	_ = app.Shutdown(mustTimeoutCtx(t))
+	shutdownOnce = true
+	app2, err := New(testConfigWithSameSeedData(t, cfg))
+	if err != nil {
+		t.Fatalf("带白名单重启失败: %v", err)
+	}
+	defer func() { _ = app2.Shutdown(mustTimeoutCtx(t)) }()
+
+	clientHost, err := libp2p.New(
+		libp2p.Identity(clientPriv),
+		libp2p.NoListenAddrs,
+		libp2p.Transport(websocket.New, websocket.WithTLSClientConfig(&tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12})),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientHost.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := clientHost.Connect(ctx, peer.AddrInfo{ID: app2.Host().ID(), Addrs: app2.Host().Addrs()}); err != nil {
+		t.Fatalf("WSS 连接失败: %v", err)
+	}
+	stream, err := clientHost.NewStream(ctx, app2.Host().ID(), protocol.ID(msfile.ProtocolID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+
+	res, err := seed.Build(bytes.NewReader(base), "wss-e2e.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hashArr [32]byte
+	copy(hashArr[:], res.SeedHash[:])
+	// 首次全量扫描异步执行：轮询直到内容 available（或超时）。
+	var fields []any
+	deadlinePoll := time.Now().Add(8 * time.Second)
+	id := uint64(1)
+	for {
+		if err := msfile.EncodeRequest(stream, []any{uint64(1), uint64(1), id, hashArr[:]}); err != nil {
+			t.Fatal(err)
+		}
+		resp, derr := msfile.DecodeResponseFields(stream)
+		if derr != nil {
+			t.Fatalf("解码 Stat 响应失败: %v", derr)
+		}
+		fields = resp
+		id++
+		if len(fields) == 7 && fields[3] == uint64(1) {
+			break
+		}
+		if time.Now().After(deadlinePoll) {
+			t.Fatalf("等待索引完成超时，最后一次响应: %#v", fields)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if len(fields) != 7 || fields[3] != uint64(1) {
+		t.Fatalf("WSS 正式链路 Stat 应回复 available: %#v", fields)
+	}
+}
+
+// writeSelfSignedCert 生成临时自签证书对，返回 (cert, key) 文件路径。
+func writeSelfSignedCert(t *testing.T) (string, string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := x509.Certificate{
+		SerialNumber:          big.NewInt(2),
+		Subject:               pkix.Name{CommonName: "msfile-nas-test"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "cert.pem")
+	keyPath := filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return certPath, keyPath
 }
