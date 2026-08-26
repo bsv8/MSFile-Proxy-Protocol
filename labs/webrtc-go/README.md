@@ -44,6 +44,14 @@ msfile-webrtc-lab relay     Circuit Relay v2 信令基础设施（只承载 rese
 
 版本均锁定在 `go.mod`；交付不允许使用未锁定的分支或本地 replace。
 
+## 验收客户端
+
+`cmd/msfile-acceptance` 提供人工验收用的协议客户端子命令：
+`stat` / `read --verify` / `verify-seed` / `load`（并发压测），
+支持 WS、WSS（`--tls-insecure` 自签）与 WebRTC Direct 地址；
+输出 JSON 结果，stderr 附中文字段说明与客户端公钥提示。
+用法详见源码头注释。
+
 ## 进程级冒烟与人工验收
 
 `internal/nas/process_e2e_test.go`（TestProcessLevelSmokeOnLocalDirectory）

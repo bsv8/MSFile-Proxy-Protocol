@@ -157,6 +157,16 @@ func TestProcessLevelSmokeOnLocalDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// 验收工具使用独立身份：两把公钥都进入白名单。
+	toolPriv, _, err := crypto.GenerateSecp256k1Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolPubRaw, err := toolPriv.GetPublic().Raw()
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	serverKeyPath := filepath.Join(dir, "identity.key")
 	sk := make([]byte, 32)
 	if _, err := rand.Read(sk); err != nil {
@@ -180,6 +190,7 @@ seed_data: %q
 access_mode: private
 public_key_whitelist:
   - "%s"
+  - "%s"
 
 full_scan_interval: 1h
 file_stable_interval: 100ms
@@ -194,6 +205,7 @@ admin_listen: "127.0.0.1:%d"
 		nasRoot,
 		filepath.Join(dir, "seed_data"),
 		hex.EncodeToString(pubRaw),
+		hex.EncodeToString(toolPubRaw),
 		wsPort, adminPort)
 	cfgPath := filepath.Join(dir, "msfile-nas.yaml")
 	if err := os.WriteFile(cfgPath, []byte(cfgText), 0o600); err != nil {
@@ -342,6 +354,45 @@ admin_listen: "127.0.0.1:%d"
 		if len(data) != block.Length {
 			t.Fatalf("块 %d 长度不符: %d != %d", block.Index, len(data), block.Length)
 		}
+	}
+
+	// 验收客户端子命令冒烟：用 msfile-acceptance 以独立身份完成 stat 与 read --verify。
+	accPath := filepath.Join(dir, "msfile-acceptance")
+	buildAcc := exec.Command("go", "build", "-o", accPath, "./cmd/msfile-acceptance")
+	buildAcc.Dir = "../.."
+	if out, err := buildAcc.CombinedOutput(); err != nil {
+		t.Fatalf("构建验收客户端失败: %v\n%s", err, out)
+	}
+	toolKeyPath := filepath.Join(dir, "tool.key")
+	toolRaw, err := toolPriv.Raw()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(toolKeyPath, []byte(hex.EncodeToString(toolRaw)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runAcc := func(args ...string) string {
+		c := exec.Command(accPath, args...)
+		c.Env = append(os.Environ(), "GOCACHE="+filepath.Join(dir, "gocache"))
+		out, err := c.CombinedOutput()
+		if err != nil {
+			t.Fatalf("验收客户端执行失败 %v:\n%s\n--- 服务端日志 ---\n%s", err, out, stdout.recent(16000))
+		}
+		return string(out)
+	}
+	movieHashHex := hex.EncodeToString(movieHash[:])
+	_ = runAcc("--addr", addrLine, "--identity-key", toolKeyPath,
+		"stat", "--hash", movieHashHex)
+	seedOut := filepath.Join(dir, "smoke-seed.bin")
+	_ = runAcc("--addr", addrLine, "--identity-key", toolKeyPath,
+		"read", "--hash", movieHashHex, "--output", seedOut, "--verify")
+	written, err := os.ReadFile(seedOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(written, resMovie.Seed) {
+		t.Fatal("验收客户端写出的 Seed 与预期不一致")
 	}
 
 	// SIGTERM：有界优雅停止且退出码为 0。
