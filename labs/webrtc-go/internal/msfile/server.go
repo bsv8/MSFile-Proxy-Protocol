@@ -254,7 +254,7 @@ func (s *Server) handleStream(stream network.Stream) {
 		}
 		return
 	}
-	defer cs.releaseRole(first.Kind)
+	// 读循环一退出就释放角色槽位（不等在途任务写完），见下方循环退出处。
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -330,8 +330,9 @@ func (s *Server) handleStream(stream network.Stream) {
 		_ = stream.SetReadDeadline(time.Now().Add(s.limits.RequestReadTimeout))
 		request, readErr := ReadRequest(reader)
 		if readErr != nil {
-			// 读循环退出：不再接受新请求；在途任务先行收尾（受上限约束，有界），
-			// 全部完成后由 defer cancel 统一释放。
+			// 读循环退出：立即释放角色槽位，让客户端可以马上重建同角色 stream；
+			// 在途任务随后有界收尾，全部完成后由 defer cancel 统一释放资源。
+			cs.releaseRole(first.Kind)
 			break
 		}
 		keepReading = handle(request)
