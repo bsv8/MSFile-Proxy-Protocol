@@ -635,11 +635,15 @@ func TestStreamRebuildKeepsRequestIDMonotonic(t *testing.T) {
 		st := openStream(t, client, server.ID())
 		defer st.Close()
 		sendRequest(t, st, statRequest(id, hash))
+		// 先半关写方向再读响应：服务端读到 EOF 后即释放角色，
+		// 收到响应时下一条 stream 的重建窗口已确定打开，
+		// 不依赖服务端异步观察 Close() 的不确定时序（阻断 1）。
+		_ = st.CloseWrite()
 		return readFields(t, bufio.NewReader(st))
 	}
 
 	var fields2 []any
-	deadlineRetry := time.Now().Add(12 * time.Second) // 全量 race 负载下角色释放可能被调度延迟
+	deadlineRetry := time.Now().Add(5 * time.Second) // 仅吸收调度噪声；正确性由上方半关保证
 	for {
 		fields2 = tryStat(3)
 		if fields2[1] == KindErrorResponse && fields2[4] == "wrong_stream_role" &&
