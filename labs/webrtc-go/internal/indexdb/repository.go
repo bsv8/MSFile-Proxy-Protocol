@@ -271,13 +271,27 @@ func (d *DB) InvalidatePaths(ctx context.Context, targets []InvalidateTarget, no
 	return err
 }
 
-// MarkLocationError 把单个位置置为 error（读取完整性失败等），保留 invalid_since 不变。
-func (d *DB) MarkLocationError(ctx context.Context, relativePath, errorZh string) error {
+// MarkLocationDirty 把读取失败的候选位置标脏为 error。
+// 三重 CAS（路径 + 当时候选的 seed_hash + revision）：任一不匹配说明位置已被
+// 新索引提交取代，返回 ErrRevisionStale 且绝不改动状态、不再触发重建调度，
+// 防止旧 Read 打脏新索引或造成可用性抖动（阻断 2）。
+func (d *DB) MarkLocationDirty(ctx context.Context, relativePath, expectedSeedHash string,
+	expectedRevision int64, reasonZh string, now time.Time) error {
+
 	_, err := call(ctx, d.exec, func(ctx context.Context, db *sql.DB) (struct{}, error) {
-		_, err := db.ExecContext(ctx,
-			`UPDATE file_locations SET state = 'error', last_error_zh = ? WHERE relative_path = ?`,
-			errorZh, relativePath)
-		return struct{}{}, err
+		result, err := db.ExecContext(ctx,
+			`UPDATE file_locations SET state = 'error', last_error_zh = ?
+			 WHERE relative_path = ? AND seed_hash = ? AND revision = ?`,
+			reasonZh, relativePath, expectedSeedHash, expectedRevision)
+		if err != nil {
+			return struct{}{}, err
+		}
+		if affected, affectedErr := result.RowsAffected(); affectedErr != nil {
+			return struct{}{}, affectedErr
+		} else if affected == 0 {
+			return struct{}{}, ErrRevisionStale
+		}
+		return struct{}{}, nil
 	})
 	return err
 }
@@ -649,7 +663,7 @@ func (d *DB) BlockCandidates(ctx context.Context, blockHash string, limit int) (
 	}
 	return call(ctx, d.exec, func(ctx context.Context, db *sql.DB) ([]BlockLocation, error) {
 		rows, err := db.QueryContext(ctx,
-			`SELECT f.relative_path, b.offset_bytes, b.length_bytes
+			`SELECT f.relative_path, f.seed_hash, f.revision, b.offset_bytes, b.length_bytes
 			 FROM seed_blocks b
 			 JOIN contents c ON c.seed_hash = b.seed_hash AND c.state = 'ready'
 			 JOIN file_locations f ON f.seed_hash = b.seed_hash AND f.state = 'valid'
@@ -663,7 +677,8 @@ func (d *DB) BlockCandidates(ctx context.Context, blockHash string, limit int) (
 		locations := make([]BlockLocation, 0, limit)
 		for rows.Next() {
 			var loc BlockLocation
-			if err := rows.Scan(&loc.RelativePath, &loc.OffsetBytes, &loc.LengthBytes); err != nil {
+			if err := rows.Scan(&loc.RelativePath, &loc.SeedHash, &loc.Revision,
+				&loc.OffsetBytes, &loc.LengthBytes); err != nil {
 				return nil, err
 			}
 			locations = append(locations, loc)

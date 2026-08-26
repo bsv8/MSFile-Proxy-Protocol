@@ -426,3 +426,48 @@ func writeSelfSignedCert(t *testing.T) (string, string) {
 	}
 	return certPath, keyPath
 }
+
+// ---------- 阻断 5：Stop 超时保留 service.lock，任务退出后才释放 ----------
+
+// TestShutdownTimeoutKeepsServiceLockUntilDrained：
+// 用可控阻塞的协调器模拟“NAS IO 永久卡住”：
+//  1. Stop 超时 → shutdown 返回错误且 service.lock 未释放（第二实例仍被拒绝）；
+//  2. 阻塞解除、后台任务真正退出 → 延迟清理完成，第二实例可以取得锁。
+func TestShutdownTimeoutKeepsServiceLockUntilDrained(t *testing.T) {
+	cfg := testConfig(t)
+	app, err := New(cfg)
+	if err != nil {
+		t.Fatalf("启动失败: %v", err)
+	}
+
+	// 注入一个受控阻塞的伪任务：直接占用协调器的 WaitGroup，
+	// 模拟 worker 卡在无法取消的网络 IO 上。
+	blocker := make(chan struct{})
+	app.coord.InjectBlockedWorkerForTest(blocker)
+
+	// 用极短超时触发 Stop 失败路径。
+	stopCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	err = app.Shutdown(stopCtx)
+	cancel()
+	if err == nil || !strings.Contains(err.Error(), "service.lock") {
+		t.Fatalf("超时停止必须报错并提示锁暂保留，实际: %v", err)
+	}
+
+	// 第二实例此刻仍必须被锁拒绝。
+	if second, serr := New(testConfigWithSameSeedData(t, cfg)); serr == nil {
+		_ = second.Shutdown(mustTimeoutCtx(t))
+		t.Fatal("未 drain 时第二实例不得取得锁")
+	}
+
+	// 解除阻塞：延迟清理完成后锁被释放。
+	close(blocker)
+	waitDeadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(waitDeadline) {
+		if probe, perr := New(testConfigWithSameSeedData(t, cfg)); perr == nil {
+			_ = probe.Shutdown(mustTimeoutCtx(t))
+			return // 成功取得锁：延迟清理已生效
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("阻塞解除后迟迟未能重新取得锁，延迟清理未执行")
+}

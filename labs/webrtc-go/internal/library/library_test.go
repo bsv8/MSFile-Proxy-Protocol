@@ -128,7 +128,13 @@ func newTestEnvFull(t *testing.T, watcherEnabled bool, clk clock.Clock) *testEnv
 func (e *testEnv) start() {
 	e.t.Helper()
 	e.coord.Start(context.Background())
-	e.t.Cleanup(e.coord.Stop)
+	e.t.Cleanup(func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if !e.coord.Stop(stopCtx) {
+			e.coord.WaitDrained()
+		}
+	})
 }
 
 func (e *testEnv) waitFor(desc string, cond func() bool) {
@@ -781,7 +787,12 @@ func TestRebuildFromEmptySeedData(t *testing.T) {
 	}
 
 	// 停止服务，模拟整库丢失：删除整个 seed_data。
-	env.coord.Stop()
+	stopCtx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
+	_ = cancel2
+	if !env.coord.Stop(stopCtx2) {
+		env.coord.WaitDrained()
+	}
+	_ = stopCtx2
 	if err := os.RemoveAll(env.cfg.SeedData); err != nil {
 		t.Fatal(err)
 	}
@@ -966,5 +977,156 @@ func TestSeedCorruptionFlowsToRebuildAndRecovery(t *testing.T) {
 	}
 	if sha256.Sum256(good) != res.SeedHash {
 		t.Fatal("重建后的 Seed 与原文件不一致")
+	}
+}
+
+// ---------- 阻断 2：旧 Read 不得打脏新索引提交 ----------
+
+func TestStaleBlockReadCannotDirtyFreshCommit(t *testing.T) {
+	env := newTestEnvWith(t, false)
+	db, store, root := env.db, env.store, env.root
+	ctx := context.Background()
+
+	base1 := genData(400000, 51)
+	path := filepath.Join(env.nasRoot, "churn.bin")
+	rel := "churn.bin"
+	writeFile(t, path, base1)
+	res1 := buildOf(t, base1)
+	if err := store.Publish(res1); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	rev1, err := db.PrepareIndex(ctx, rel, 1, now,
+		indexdb.TargetFingerprint{SizeBytes: res1.SourceSize, MtimeNs: now.UnixNano()}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p1 := commitOfPath(res1, now, rel)
+	p1.ExpectedRevision = rev1
+	if err := db.CommitSeedResult(ctx, p1, now); err != nil {
+		t.Fatal(err)
+	}
+
+	// 模拟旧 Read 已拿到候选列表，此时文件被替换并完成新 revision 提交。
+	candidates, err := db.BlockCandidates(ctx, hex.EncodeToString(res1.Blocks[0].Hash[:]), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) == 0 || candidates[0].RelativePath != rel {
+		t.Fatalf("应拿到 churn.bin 候选: %+v", candidates)
+	}
+	stale := candidates[0]
+
+	base2 := genData(400000, 52)
+	writeFile(t, path, base2)
+	res2 := buildOf(t, base2)
+	if err := store.Publish(res2); err != nil {
+		t.Fatal(err)
+	}
+	later := now.Add(time.Minute)
+	rev2, err := db.PrepareIndex(ctx, rel, 2, later,
+		indexdb.TargetFingerprint{SizeBytes: res2.SourceSize, MtimeNs: later.UnixNano()}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2 := commitOfPath(res2, later, rel)
+	p2.ExpectedRevision = rev2
+	if err := db.CommitSeedResult(ctx, p2, later); err != nil {
+		t.Fatal(err)
+	}
+
+	// 旧读取失败后按候选快照标脏：必须 CAS 失败，新索引保持 valid。
+	err = db.MarkLocationDirty(ctx, stale.RelativePath, stale.SeedHash, stale.Revision,
+		"旧块读取失败", time.Now())
+	if !errors.Is(err, indexdb.ErrRevisionStale) {
+		t.Fatalf("旧候选标脏必须返回 ErrRevisionStale，实际: %v", err)
+	}
+	fps, _ := db.ListFingerprints(ctx)
+	fp := fps[rel]
+	if fp.State != indexdb.LocationValid || fp.SeedHash != res2.HashHex() {
+		t.Fatalf("新索引不得被旧 Read 打脏：%+v", fp)
+	}
+
+	// 用当前候选标脏则正常生效。
+	cur, err := db.BlockCandidates(ctx, hex.EncodeToString(res2.Blocks[0].Hash[:]), 4)
+	if err != nil || len(cur) == 0 {
+		t.Fatalf("当前候选查询失败: %v", err)
+	}
+	if err := db.MarkLocationDirty(ctx, cur[0].RelativePath, cur[0].SeedHash, cur[0].Revision,
+		"当前块确实损坏", time.Now()); err != nil {
+		t.Fatalf("当前候选标脏不应失败: %v", err)
+	}
+	fps, _ = db.ListFingerprints(ctx)
+	if fps[rel].State != indexdb.LocationError {
+		t.Fatalf("当前候选标脏应生效，实际 %+v", fps[rel])
+	}
+	_ = root
+}
+
+// ---------- 阻断 4：挂载恢复（根目录 inode 变化）后指纹一致不重算、块可读 ----------
+
+func TestRemountWithSameFingerprintReusesSeedAndBlockReadWorks(t *testing.T) {
+	env := newTestEnvWith(t, false)
+	base := genData(350000, 61)
+	path := filepath.Join(env.nasRoot, "remount.bin")
+	writeFile(t, path, base)
+	res := buildOf(t, base)
+	env.start()
+	env.waitFor("初始索引完成", func() bool { return env.contentReady(res.HashHex()) })
+
+	seedPath := env.store.Path(res.HashHex())
+	seedBefore, err := os.Stat(seedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 模拟卸载后重新挂载：换掉挂载点目录本身（根目录 inode 改变，触发 safefs 自愈），
+	// 但通过 rename 移回文件——文件 inode/mtime 保持不变，
+	// 对应真实 NAS 上“服务端 inode 稳定、客户端重新挂载”的场景。
+	hidden := filepath.Join(env.dir, "nas_data.unmounted")
+	fresh := filepath.Join(env.dir, "nas_data.fresh")
+	if err := os.MkdirAll(fresh, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(env.nasRoot, hidden); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(fresh, env.nasRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(hidden, "remount.bin"), path); err != nil {
+		t.Fatal(err)
+	}
+
+	// 触发扫描：指纹一致 → 复用 Seed，不调用 Builder。
+	env.waitFor("上一轮结束", func() bool { return !env.coord.Scanning() })
+	env.coord.TriggerFullScan()
+	env.waitFor("恢复确认", func() bool { return env.contentReady(res.HashHex()) })
+	time.Sleep(30 * time.Millisecond)
+
+	seedAfter, err := os.Stat(seedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(seedBefore, seedAfter) || !seedBefore.ModTime().Equal(seedAfter.ModTime()) {
+		t.Fatal("挂载恢复且指纹一致必须复用原 Seed 文件（inode/mtime 不变 ⇒ Builder 未被调用）")
+	}
+
+	// 关键路径：块 Read 直接经 safefs.Root 完成——Root 必须已自愈，
+	// 否则会触发标脏重索引（违反不重算）。
+	reader := content.New(env.root, env.db, env.store, env.coord)
+	block := res.Blocks[0]
+	data, err := reader.ReadBlock(context.Background(), hex.EncodeToString(block.Hash[:]))
+	if err != nil {
+		t.Fatalf("挂载恢复后的块读取失败: %v", err)
+	}
+	if sha256.Sum256(data) != block.Hash {
+		t.Fatal("块内容校验失败")
+	}
+}
+
+func restoreMtime(t *testing.T, path string, at time.Time) {
+	t.Helper()
+	if err := os.Chtimes(path, at, at); err != nil {
+		t.Fatal(err)
 	}
 }

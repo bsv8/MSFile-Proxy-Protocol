@@ -161,14 +161,15 @@ func NewServer(h host.Host, reader ContentSource, policy *auth.Policy, log *metr
 // NewServerWithLimits 允许测试注入更小的资源上限。
 func NewServerWithLimits(h host.Host, reader ContentSource, policy *auth.Policy, log *metrics.Logger, limits Limits) *Server {
 	s := &Server{
-		host:    h,
-		reader:  reader,
-		policy:  policy,
-		log:     log,
-		limits:  limits,
-		readSem: make(chan struct{}, maxInt(limits.MaxConcurrentReads, 1)),
-		conns:   make(map[string]*connState),
-		stopCh:  make(chan struct{}),
+		host:         h,
+		reader:       reader,
+		policy:       policy,
+		log:          log,
+		limits:       limits,
+		readSem:      make(chan struct{}, maxInt(limits.MaxConcurrentReads, 1)),
+		conns:        make(map[string]*connState),
+		stopCh:       make(chan struct{}),
+		globalBucket: newRateBucket(limits.GlobalWriteBytesPerSec), // 全局桶必须在此初始化（阻断 1）
 	}
 	h.Network().Notify(&network.NotifyBundle{
 		DisconnectedF: func(_ network.Network, conn network.Conn) {
@@ -254,7 +255,12 @@ func (s *Server) handleStream(stream network.Stream) {
 		}
 		return
 	}
-	// 读循环一退出就释放角色槽位（不等在途任务写完），见下方循环退出处。
+	// 读循环以任何方式退出（EOF、超时、mixed-role、writer 失败、服务关闭）
+	// 都必须释放角色：releaseRole 幂等，这里注册 defer 兜底，
+	// 读循环正常退出路径会提前显式调用以尽快让位给重建的 stream。
+	var releaseOnce sync.Once
+	releaseRoleOnce := func() { releaseOnce.Do(func() { cs.releaseRole(first.Kind) }) }
+	defer releaseRoleOnce()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -270,6 +276,7 @@ func (s *Server) handleStream(stream network.Stream) {
 	handle := func(request Request) bool {
 		if request.Kind != first.Kind {
 			responses <- response{fields: Error(request.Kind, request.ID, "wrong_stream_role", "Stat 与 Read 必须使用不同 stream", 0)}
+			releaseRoleOnce() // mixed-role 终止本 stream，立即让出角色
 			return false
 		}
 		// 角色已在外部占用（认证 → claimRole → defer release）。
@@ -570,9 +577,12 @@ func maxInt(a, b int) int {
 // ---------- 带宽令牌桶（需求 §9/§10：public 必须有带宽上限） ----------
 
 // rateBucket 是惰性补充的令牌桶；rate<=0 表示不限速。
+// 桶容量（突发额度）独立于速率，默认 rate/8 且夹在 16KiB..512KiB，
+// 避免整秒突发一次性放行导致限流形同虚设。
 type rateBucket struct {
 	mu     sync.Mutex
 	rate   float64 // 字节/秒
+	burst  float64 // 桶容量（字节）
 	tokens float64
 	last   time.Time
 }
@@ -581,7 +591,15 @@ func newRateBucket(bytesPerSec int64) *rateBucket {
 	if bytesPerSec <= 0 {
 		return nil
 	}
-	return &rateBucket{rate: float64(bytesPerSec), tokens: float64(bytesPerSec), last: time.Now()}
+	rate := float64(bytesPerSec)
+	burst := rate / 8
+	if burst < 16*1024 {
+		burst = 16 * 1024
+	}
+	if burst > 512*1024 {
+		burst = 512 * 1024
+	}
+	return &rateBucket{rate: rate, burst: burst, tokens: burst, last: time.Now()}
 }
 
 // take 阻塞直到获取 n 个字节的配额；ctx 取消时提前返回。
@@ -595,8 +613,8 @@ func (b *rateBucket) take(ctx context.Context, n int) error {
 		elapsed := now.Sub(b.last).Seconds()
 		b.last = now
 		b.tokens += elapsed * b.rate
-		if max := b.rate; b.tokens > max {
-			b.tokens = max // 桶容量 = 1 秒突发
+		if b.tokens > b.burst {
+			b.tokens = b.burst
 		}
 		grant := b.tokens
 		if grant > float64(n) {

@@ -167,8 +167,7 @@ func New(cfg *config.Config) (*App, error) {
 	app.reader = content.New(root, db, store, coord)
 
 	// 8. 注册正式 /msfile/1.0.0 文件服务（不注册实验协议；仅此一次）。
-	app.msfileS = msfile.NewServer(h, app.reader, policy, log)
-	app.msfileS = msfile.NewServer(h, app.reader, policy, log)
+	app.msfileS = msfile.NewServer(h, app.reader, policy, log) // 仅注册一次（阻断 5 清理项）
 	adminHandler := admin.New(db, coord, admin.Options{
 		AdminToken:    cfg.AdminToken,
 		PeerID:        selfID.String(),
@@ -233,6 +232,8 @@ func (a *App) Run(ctx context.Context) error {
 }
 
 // Shutdown 触发有界优雅停止；幂等。与 Run 并发调用安全。
+// 内部 shutdown 自身受 timeout 约束必然返回（超时路径会保留 service.lock
+// 并启动延迟清理），因此这里直接等待其结果，不与外部 ctx 竞争。
 func (a *App) Shutdown(ctx context.Context) error {
 	timeout := shutdownTimeout
 	if deadline, ok := ctx.Deadline(); ok {
@@ -240,14 +241,7 @@ func (a *App) Shutdown(ctx context.Context) error {
 			timeout = remaining
 		}
 	}
-	errCh := make(chan error, 1)
-	go func() { errCh <- a.shutdown(timeout) }()
-	select {
-	case err := <-errCh:
-		return err
-	case <-ctx.Done():
-		return ctx.Err() // 有界等待超时：保留失败现场供诊断
-	}
+	return a.shutdown(timeout)
 }
 
 // shutdown 执行一次真正的有序停止；由 stopOnce 保证只执行一遍。
@@ -288,10 +282,30 @@ func (a *App) shutdown(timeout time.Duration) error {
 		if a.host != nil {
 			record(a.host.Close())
 		}
-		// 3) 停止 watcher、周期扫描、Hash worker（内部有界等待）。
-		a.coord.Stop()
-		// 4) drain SQLite executor 后关闭数据库。
+		// 3) 停止 watcher、周期扫描、Hash worker；未 drain 时不得释放
+		//    其仍可能访问的 DB / safefs.Root / service.lock（阻断 5）。
+		if !a.coord.Stop(stopCtx) {
+			// 启动最终清理 goroutine：任务真正退出后按 Root → DB → lock 顺序释放。
+			go func() {
+				a.coord.WaitDrained()
+				_ = a.db.Close()
+				if a.root != nil {
+					_ = a.root.Close()
+				}
+				a.release()
+				a.log.Emit("nas_stopped_deferred", map[string]any{
+					"reason_zh": "超时后后台任务已全部退出，延迟完成最终清理并释放 service.lock",
+				})
+			}()
+			firstErr = errors.New("停止超时：后台任务未完全退出，service.lock 暂时保留以阻止第二实例")
+			a.shutdownErr = firstErr
+			return
+		}
+		// 4) drain SQLite executor 后关闭数据库与安全根。
 		record(a.db.Close())
+		if a.root != nil {
+			record(a.root.Close())
+		}
 		// 5) 释放 service.lock。
 		a.release()
 		a.log.Emit("nas_stopped", map[string]any{})

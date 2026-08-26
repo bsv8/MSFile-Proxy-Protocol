@@ -39,7 +39,7 @@ func (d *dirtyRecorder) MarkSeedDirty(seedHashHex, _ string) {
 	d.paths = append(d.paths, seedHashHex)
 }
 
-func (d *dirtyRecorder) MarkLocationDirty(relativePath, _ string) {
+func (d *dirtyRecorder) MarkLocationDirty(relativePath, _ string, _ int64, _ string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.paths = append(d.paths, relativePath)

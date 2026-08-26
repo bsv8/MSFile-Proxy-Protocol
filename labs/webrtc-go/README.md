@@ -67,6 +67,6 @@ go build ./cmd/msfile-webrtc-lab
 | T19–T21、T22、T23 | ✅ | internal/msfile（CBOR 严格性 / 双 stream / WS、WSS、WebRTC Direct E2E） |
 | T24 | ✅ | internal/admin |
 | T25–T26 | ✅ | internal/nas（第二实例锁、旧 schema fail closed、端口冲突回滚） |
-| T27 | 部分 | internal/msfile（在途请求硬上限 rate_limited）；带宽限流待部署压测 |
+| T27 | ✅ 自动化部分：在途请求双层硬上限、全局/单连接带宽令牌桶、多连接并发冲击断言峰值不超限；真实 NAS 磁盘吞吐压测归入部署人工验证 |
 
 目标 NAS 挂载的人工验证仍按施工单 §10 在真实部署环境执行。

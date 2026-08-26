@@ -588,17 +588,29 @@ func TestMarkInvalidNowAndLocationFailure(t *testing.T) {
 		t.Errorf("upsert 后占位行应被更新，实际 %+v", placeholder)
 	}
 
-	// MarkLocationError：置 error 但保留 invalid_since。
+	// MarkLocationDirty（CAS 版）：候选 seed_hash/revision 匹配时置 error。
 	errPath := "videos/live.mkv"
-	if err := tdb.MarkLocationError(bg, errPath, "读取完整性校验失败"); err != nil {
-		t.Fatalf("MarkLocationError 失败: %v", err)
+	curSeed := seed // 该位置当前仍指向此内容
+	fpsMarkDirty, fpsErr := tdb.ListFingerprints(bg)
+	if fpsErr != nil {
+		t.Fatal(fpsErr)
+	}
+	if err := tdb.MarkLocationDirty(bg, errPath, curSeed, fpsMarkDirty[errPath].Revision,
+		"读取完整性校验失败", time.Now()); err != nil {
+		t.Fatalf("MarkLocationDirty 失败: %v", err)
 	}
 	marked := getLocation(t, tdb.DB, bg, seed, errPath, now.Add(3*time.Minute))
 	if marked.State != LocationError {
-		t.Errorf("MarkLocationError 后状态应为 error，实际 %q", marked.State)
+		t.Errorf("MarkLocationDirty 后状态应为 error，实际 %q", marked.State)
 	}
 	if marked.InvalidSince == nil || !marked.InvalidSince.Equal(firstSince) {
-		t.Errorf("MarkLocationError 应保留 invalid_since=%v，实际 %v", firstSince, marked.InvalidSince)
+		t.Errorf("应保留 invalid_since=%v，实际 %v", firstSince, marked.InvalidSince)
+	}
+
+	// CAS 不命中：seed_hash 不匹配（位置已被新内容取代的模拟）返回 ErrRevisionStale。
+	if err := tdb.MarkLocationDirty(bg, errPath, hexHash('f', 777), fpsMarkDirty[errPath].Revision,
+		"过期读取", time.Now().Add(time.Second)); !errors.Is(err, ErrRevisionStale) {
+		t.Fatalf("seed_hash 不匹配必须返回 ErrRevisionStale，实际: %v", err)
 	}
 }
 

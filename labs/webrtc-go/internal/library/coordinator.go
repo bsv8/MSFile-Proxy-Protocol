@@ -112,11 +112,12 @@ type Coordinator struct {
 	// FilterUnreferenced->MoveToTrash->DeleteContents，防止刚发布的 Seed 被 GC 回收。
 	seedLifecycleMu sync.Mutex
 
-	watcher  *fileWatcher
-	ctx      context.Context
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
-	stopOnce sync.Once
+	watcher      *fileWatcher
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
+	fullyStopped chan struct{}
+	stopOnce     sync.Once
 }
 
 // New 创建协调器；调用 Start 前不会启动任何 goroutine。
@@ -126,19 +127,20 @@ func New(cfg *config.Config, db *indexdb.DB, store *seed.Store, log *metrics.Log
 	root *safefs.Root) (*Coordinator, error) {
 
 	return &Coordinator{
-		cfg:      cfg,
-		db:       db,
-		store:    store,
-		log:      log,
-		clk:      cfg.Clock,
-		nasRoot:  cfg.NASData,
-		root:     root,
-		pendingG: make(map[string]int64),
-		inQueue:  make(map[string]struct{}),
-		attempts: make(map[string]int),
-		notifyCh: make(chan struct{}, 1),
-		jobs:     make(chan IndexJob, cfg.HashWorkers*8),
-		manual:   make(chan struct{}, 1),
+		cfg:          cfg,
+		db:           db,
+		store:        store,
+		log:          log,
+		clk:          cfg.Clock,
+		nasRoot:      cfg.NASData,
+		root:         root,
+		pendingG:     make(map[string]int64),
+		inQueue:      make(map[string]struct{}),
+		attempts:     make(map[string]int),
+		notifyCh:     make(chan struct{}, 1),
+		jobs:         make(chan IndexJob, cfg.HashWorkers*8),
+		manual:       make(chan struct{}, 1),
+		fullyStopped: make(chan struct{}),
 	}, nil
 }
 
@@ -182,9 +184,12 @@ func (c *Coordinator) Start(parent context.Context) {
 	}
 }
 
-// Stop 按冻结顺序停止：
-// 先停 watcher（不再产生新调度）-> 取消扫描/Hash 任务 -> 等待全部退出（有界）。
-func (c *Coordinator) Stop() {
+// Stop 按冻结顺序停止，并返回是否已完全 drain：
+// 先停 watcher（不再产生新调度）→ 取消扫描/Hash 任务 → 有界等待退出。
+// 返回 false 表示超时仍有后台任务未退出（例如网络挂载 IO 永久阻塞）；
+// 调用方此时不得释放该协调器仍可能访问的 DB / safefs.Root / service.lock，
+// 应等待 WaitDrained 后再执行最终清理（阻断 5）。
+func (c *Coordinator) Stop(ctx context.Context) bool {
 	c.stopOnce.Do(func() {
 		if c.watcher != nil {
 			c.watcher.Stop()
@@ -193,19 +198,25 @@ func (c *Coordinator) Stop() {
 		if c.cancel != nil {
 			c.cancel()
 		}
+		// 独立 goroutine 等待全部任务退出；WaitDrained 依赖其完成信号。
+		go func() {
+			c.wg.Wait()
+			close(c.fullyStopped)
+		}()
 	})
-	// 有界等待：网络挂载读可能永久阻塞，不能让 Stop 无限期挂起；
-	// ctx 取消已通知全部 goroutine，超时后仅记录中文诊断。
-	waitCh := make(chan struct{})
-	go func() { c.wg.Wait(); close(waitCh) }()
 	select {
-	case <-waitCh:
-	case <-time.After(10 * time.Second):
+	case <-c.fullyStopped:
+		return true
+	case <-ctx.Done():
 		c.log.Emit("library_stop_timeout", map[string]any{
-			"reason_zh": "停止等待超时（可能有阻塞中的文件 IO），后台任务将在 IO 返回后退出",
+			"reason_zh": "停止等待超时（可能有阻塞中的文件 IO），service.lock 将保留至任务真正退出",
 		})
+		return false
 	}
 }
+
+// WaitDrained 阻塞直到全部后台任务真正退出（须在 Stop 之后调用）。
+func (c *Coordinator) WaitDrained() { <-c.fullyStopped }
 
 // QueueDepth 返回当前排队路径数，供管理台展示。
 func (c *Coordinator) QueueDepth() int {
@@ -311,15 +322,25 @@ func (c *Coordinator) MarkSeedDirty(seedHashHex, reasonZh string) {
 	c.SchedulePath("Seed 损坏，从原文件强制重建", 0, locations...)
 }
 
-// MarkLocationDirty 实现 content.DirtyListener：
-// 单个原文件位置读取或校验失败时标脏并强制重索引。
-func (c *Coordinator) MarkLocationDirty(relativePath, reasonZh string) {
+// MarkLocationDirty 实现 content.DirtyListener（阻断 2）：
+// 携带候选时刻的 seed_hash 与 revision 做 CAS 标脏。
+// CAS 未命中说明该位置已被新索引提交取代：不得改动状态、不得触发重建，
+// 否则旧 Read 会造成可用性抖动与无谓重算。
+func (c *Coordinator) MarkLocationDirty(relativePath, seedHashHex string, revision int64, reasonZh string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := c.db.MarkLocationError(ctx, relativePath, reasonZh); err != nil {
+	err := c.db.MarkLocationDirty(ctx, relativePath, seedHashHex, revision, reasonZh, c.clk.Now())
+	switch {
+	case err == nil:
+		c.SchedulePath("读取完整性失败，标脏重索引", 0, relativePath)
+	case errors.Is(err, indexdb.ErrRevisionStale):
+		c.log.Emit("library_dirty_stale_skip", map[string]any{
+			"path_zh":   relativePath,
+			"reason_zh": "读取失败的位置已被新索引提交取代，跳过标脏",
+		})
+	default:
 		c.log.Emit("library_mark_dirty_failed", map[string]any{"error": err.Error()})
 	}
-	c.SchedulePath("读取完整性失败，标脏重索引", 0, relativePath)
 }
 
 func (c *Coordinator) dispatchLoop(ctx context.Context) {
@@ -575,4 +596,14 @@ func toBlockRows(blocks []seed.Block) []indexdb.SeedBlock {
 		})
 	}
 	return rows
+}
+
+// InjectBlockedWorkerForTest 注册一个受控阻塞的后台任务，
+// 仅供 nas 包验证“停止超时保留 service.lock”语义（跨包测试钩子）。
+func (c *Coordinator) InjectBlockedWorkerForTest(done <-chan struct{}) {
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		<-done
+	}()
 }

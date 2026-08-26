@@ -969,3 +969,217 @@ func mustClientHost(t *testing.T) host.Host {
 	h := buildTestHost(t, newKeyPair(t), false)
 	return h
 }
+
+// ---------- 阻断 1：带宽限流三场景（全局 / 单连接 / 不限速） ----------
+
+type bigSource struct{ payload []byte }
+
+func (b *bigSource) Stat(context.Context, string) (content.StatInfo, bool, error) {
+	return content.StatInfo{Filename: "x", SizeBytes: int64(len(b.payload))}, true, nil
+}
+func (b *bigSource) Resolve(context.Context, string) ([]byte, error) { return b.payload, nil }
+
+// drainAll 读取一个完整 Frame（含 attachment）并返回耗时。
+func drainAll(t *testing.T, st network.Stream, reader *bufio.Reader) time.Duration {
+	t.Helper()
+	start := time.Now()
+	fields := readFields(t, reader)
+	if fields[1] != KindReadResponse {
+		t.Fatalf("期望 ReadResponse，实际 %#v", fields)
+	}
+	data := make([]byte, fields[4].(uint64))
+	if _, err := io.ReadFull(reader, data); err != nil {
+		t.Fatalf("读取 attachment: %v", err)
+	}
+	return time.Since(start)
+}
+
+// TestBandwidthGlobalBucketSharedAcrossConnections：
+// 两条连接同时下载时聚合吞吐受全局桶限制。
+func TestBandwidthGlobalBucketSharedAcrossConnections(t *testing.T) {
+	const kb = 1024
+	limits := DefaultLimits()
+	limits.GlobalWriteBytesPerSec = 400 * kb
+	limits.ConnWriteBytesPerSec = 0 // 关闭单连接限制，隔离变量
+	server, ca, cb, _ := func() (host.Host, host.Host, host.Host, []byte) {
+		serverPriv := newKeyPair(t)
+		policy, err := auth.NewPolicy("public", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload := bytes.Repeat([]byte{0xA5}, 300*kb)
+		server := buildTestHost(t, serverPriv, false)
+		NewServerWithLimits(server, &bigSource{payload: payload}, policy, metrics.New("bw"), limits)
+		ca := buildTestHost(t, newKeyPair(t), false)
+		cb := buildTestHost(t, newKeyPair(t), false)
+		mustConnect(t, ca, server)
+		mustConnect(t, cb, server)
+		return server, ca, cb, payload
+	}()
+
+	run := func(c host.Host, id uint64) <-chan time.Duration {
+		out := make(chan time.Duration, 1)
+		go func() {
+			st := openStream(t, c, server.ID())
+			defer st.Close()
+			var hash [32]byte
+			hash[0] = byte(id)
+			if err := msfileEncodeReadForTest(st, id, hash); err != nil {
+				t.Error(err)
+				out <- 0
+				return
+			}
+			out <- drainAll(t, st, bufio.NewReader(st))
+		}()
+		return out
+	}
+	d1 := run(ca, 1)
+	d2 := run(cb, 2)
+
+	e1, e2 := <-d1, <-d2
+	total := maxDuration(e1, e2)
+	// 600KB @400KB/s ≈ 1.5s；留出调度余量下限 1.0s，上限 6s 防止 CI 卡死误判。
+	if total < 900*time.Millisecond {
+		t.Fatalf("全局桶未生效：两连接并行 %v 完成总传输（应 ≥900ms）", total)
+	}
+	if total > 8*time.Second {
+		t.Fatalf("传输过慢，疑似限流配置错误：%v", total)
+	}
+}
+
+// TestBandwidthPerConnLimitIndependent：仅单连接限速时，
+// 两条连接并行下载的总耗时应接近单连接耗时（各自独立配额）。
+func TestBandwidthPerConnLimitIndependent(t *testing.T) {
+	const kb = 1024
+	limits := DefaultLimits()
+	limits.GlobalWriteBytesPerSec = 0 // 关闭全局，隔离变量
+	limits.ConnWriteBytesPerSec = 150 * kb
+
+	serverPriv := newKeyPair(t)
+	policy, _ := auth.NewPolicy("public", nil)
+	payload := bytes.Repeat([]byte{0x5A}, 200*kb)
+	server := buildTestHost(t, serverPriv, false)
+	NewServerWithLimits(server, &bigSource{payload: payload}, policy, metrics.New("bw"), limits)
+	ca := buildTestHost(t, newKeyPair(t), false)
+	cb := buildTestHost(t, newKeyPair(t), false)
+	mustConnect(t, ca, server)
+	mustConnect(t, cb, server)
+
+	var wg sync.WaitGroup
+	start := time.Now()
+	for _, c := range []host.Host{ca, cb} {
+		wg.Add(1)
+		go func(c host.Host) {
+			defer wg.Done()
+			st := openStream(t, c, server.ID())
+			defer st.Close()
+			var hash [32]byte
+			_ = msfileEncodeReadForTest(st, 1, hash)
+			drainAll(t, st, bufio.NewReader(st))
+		}(c)
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+	// 每条连接 200KB@150KB/s≈1.33s，并行执行 → 总时长约 1.4-3s；
+	// 若共享同一桶则需 ~2.7s+。取并行判定上限 2.2s。
+	if elapsed < 1200*time.Millisecond {
+		t.Fatalf("单连接桶未生效：%v 完成", elapsed)
+	}
+	if elapsed > 2500*time.Millisecond {
+		t.Fatalf("并行独立性被破坏（疑似串行化）：%v", elapsed)
+	}
+}
+
+// TestBandwidthUnlimitedWhenZero：两个速率都为 0 时完全不限速。
+func TestBandwidthUnlimitedWhenZero(t *testing.T) {
+	limits := DefaultLimits()
+	limits.GlobalWriteBytesPerSec = 0
+	limits.ConnWriteBytesPerSec = 0
+	serverPriv := newKeyPair(t)
+	policy, _ := auth.NewPolicy("public", nil)
+	payload := bytes.Repeat([]byte{0x77}, 2<<20) // 2 MiB
+	server := buildTestHost(t, serverPriv, false)
+	NewServerWithLimits(server, &bigSource{payload: payload}, policy, metrics.New("bw"), limits)
+	client := buildTestHost(t, newKeyPair(t), false)
+	mustConnect(t, client, server)
+
+	start := time.Now()
+	st := openStream(t, client, server.ID())
+	defer st.Close()
+	var hash [32]byte
+	_ = msfileEncodeReadForTest(st, 1, hash)
+	drainAll(t, st, bufio.NewReader(st))
+	if elapsed := time.Since(start); elapsed > 800*time.Millisecond {
+		t.Fatalf("0=不限速语义被破坏，2MiB 耗时 %v", elapsed)
+	}
+}
+
+func maxDuration(a, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// msfileEncodeReadForTest 组装并发送一个 ReadRequest（测试辅助）。
+func msfileEncodeReadForTest(w io.Writer, id uint64, hash [32]byte) error {
+	return EncodeRequest(w, []any{uint64(1), uint64(3), id, hash[:], uint64(0)})
+}
+
+// ---------- 阻断 3：mixed-role 后角色立即释放 ----------
+
+// TestMixedRoleReleasesSlotForRebuiltStream：
+// 同一 stream 混入另一类请求收到 wrong_stream_role 后，
+// 无需断开 connection 即可重建同角色 stream 并正常服务。
+func TestMixedRoleReleasesSlotForRebuiltStream(t *testing.T) {
+	env := newTestEnv(t)
+	serverPriv := newKeyPair(t)
+	clientPriv := newKeyPair(t)
+	clientKeyHex, err := identityPubHex(clientPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := auth.NewPolicy("private", []string{clientKeyHex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := buildTestHost(t, serverPriv, false)
+	client := buildTestHost(t, clientPriv, false)
+	NewServer(server, env.reader, policy, metrics.New("test"))
+	mustConnect(t, client, server)
+	hash := seedHash32(t, env.result)
+
+	s1 := openStream(t, client, server.ID())
+	sendRequest(t, s1, statRequest(7, hash))
+	fields := readFields(t, bufio.NewReader(s1))
+	if fields[1] != KindStatResponse {
+		t.Fatalf("首个 Stat 应成功: %#v", fields)
+	}
+	sendRequest(t, s1, readRequest(8, hash, 0))
+	fields = readFields(t, bufio.NewReader(s1))
+	if fields[1] != KindErrorResponse || fields[4] != "wrong_stream_role" {
+		t.Fatalf("mixed-role 应报 wrong_stream_role: %#v", fields)
+	}
+	_ = s1.Close()
+
+	deadlineRetry := time.Now().Add(5 * time.Second)
+	for {
+		st := openStream(t, client, server.ID())
+		sendRequest(t, st, statRequest(9, hash))
+		_ = st.CloseWrite()
+		fields = readFields(t, bufio.NewReader(st))
+		if isWrongRole(fields) && time.Now().Before(deadlineRetry) {
+			time.Sleep(30 * time.Millisecond)
+			continue
+		}
+		if fields[1] == KindStatResponse && fields[2] == uint64(9) {
+			break
+		}
+		t.Fatalf("mixed-role 后重建同角色 stream 应成功，实际: %#v", fields)
+	}
+}
+
+// isWrongRole 判断响应是否为 wrong_stream_role（测试辅助）。
+func isWrongRole(f []any) bool {
+	return len(f) >= 5 && f[1] == KindErrorResponse && f[4] == "wrong_stream_role"
+}

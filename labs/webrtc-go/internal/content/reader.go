@@ -74,7 +74,9 @@ type StatInfo struct {
 // 不再使用“空路径表示 Seed 损坏”的隐式约定。
 type DirtyListener interface {
 	MarkSeedDirty(seedHashHex, reasonZh string)
-	MarkLocationDirty(relativePath, reasonZh string)
+	// MarkLocationDirty 携带候选时刻的 seed_hash 与 revision：
+	// 协调器据此做 CAS 标脏，旧 Read 无法打脏已被新索引提交取代的位置。
+	MarkLocationDirty(relativePath, seedHashHex string, revision int64, reasonZh string)
 }
 
 // Reader 是 MSFile 服务端的内容真值入口。
@@ -161,7 +163,8 @@ func (r *Reader) ReadBlock(ctx context.Context, blockHashHex string) ([]byte, er
 			return data, nil
 		}
 		lastErr = readErr
-		r.markLocationDirty(candidate.RelativePath, "块读取或校验失败："+readErr.Error())
+		r.markLocationDirty(candidate.RelativePath, candidate.SeedHash,
+			candidate.Revision, "块读取或校验失败："+readErr.Error())
 	}
 	if errors.Is(lastErr, ErrIntegrity) || isIntegrityCause(lastErr) {
 		return nil, ErrIntegrity
@@ -186,9 +189,9 @@ func (r *Reader) markSeedDirty(seedHashHex, reasonZh string) {
 	}
 }
 
-func (r *Reader) markLocationDirty(relativePath, reasonZh string) {
+func (r *Reader) markLocationDirty(relativePath, seedHashHex string, revision int64, reasonZh string) {
 	if r.dirty != nil {
-		r.dirty.MarkLocationDirty(relativePath, reasonZh)
+		r.dirty.MarkLocationDirty(relativePath, seedHashHex, revision, reasonZh)
 	}
 }
 

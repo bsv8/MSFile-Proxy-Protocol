@@ -87,10 +87,13 @@ type ScanRun struct {
 }
 
 // BlockLocation 是块读取的一个候选位置：从哪个原文件的哪个偏移读取该块。
+// SeedHash 与 Revision 用于读取失败时的标脏 CAS（阻断 2）。
 type BlockLocation struct {
-	RelativePath string `json:"relative_path"`
-	OffsetBytes  int64  `json:"offset_bytes"`
-	LengthBytes  int64  `json:"length_bytes"`
+	RelativePath string `json:"relative_path"` // nas_data 内部相对路径
+	SeedHash     string `json:"-"`             // 候选时刻该位置指向的内容
+	Revision     int64  `json:"-"`             // 候选时刻的位置版本
+	OffsetBytes  int64  `json:"offset_bytes"`  // block_index * 262144
+	LengthBytes  int64  `json:"length_bytes"`  // 1..262144
 }
 
 // ContentSummary 是管理台列表行：contents 加上可用副本数。
