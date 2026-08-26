@@ -113,20 +113,10 @@ func NormalizeCompressedPubKeyHex(k string) (string, error) {
 
 func (w *Whitelist) Contains(hexKey string) bool {
 	if w == nil {
-		return false
-	}
-	// Demo 模式：没有配置任何白名单项时，允许所有已经通过 libp2p Noise
-	// 身份认证的 secp256k1 客户端。调用方仍需先验证远端公钥类型。
-	if len(w.keys) == 0 {
-		return true
+		return false // 空白名单拒绝全部客户端；不存在 allow-all 回退
 	}
 	_, ok := w.keys[strings.ToLower(strings.TrimSpace(hexKey))]
 	return ok
-}
-
-// AllowsAll 表示当前处于仅供实验使用的免白名单模式。
-func (w *Whitelist) AllowsAll() bool {
-	return w != nil && len(w.keys) == 0
 }
 
 func (w *Whitelist) Size() int {

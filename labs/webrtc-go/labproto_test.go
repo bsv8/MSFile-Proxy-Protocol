@@ -260,7 +260,7 @@ func TestIdentityProtocolReportsConnectionTruth(t *testing.T) {
 	}
 }
 
-func TestEmptyWhitelistAllowsAuthenticatedSecp256k1Client(t *testing.T) {
+func TestEmptyWhitelistRejectsAllClients(t *testing.T) {
 	nasPriv := keyFromHex(t, randomScalarHex(t))
 	clientPriv := keyFromHex(t, randomScalarHex(t))
 	clientID, err := identity.PeerID(clientPriv)
@@ -270,22 +270,19 @@ func TestEmptyWhitelistAllowsAuthenticatedSecp256k1Client(t *testing.T) {
 
 	nasHost := buildHost(t, nasPriv)
 	clientHost := buildHost(t, clientPriv)
-	registerServer(t, nasHost, nil)
+	registerServer(t, nasHost, nil) // 空白名单：拒绝全部客户端
 	mustConnect(t, clientHost, nasHost)
 
 	stream := openStream(t, clientHost, nasHost.ID(), labproto.ProtocolIdentity)
 	defer stream.Close()
-	raw, err := io.ReadAll(io.LimitReader(stream, 64*1024))
-	if err != nil {
-		t.Fatalf("demo allow-all identity read: %v", err)
+	if err := stream.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
 	}
-	var diag map[string]any
-	if err := json.Unmarshal(raw, &diag); err != nil {
-		t.Fatalf("identity response not JSON (%q): %v", string(raw), err)
+	raw, _ := io.ReadAll(io.LimitReader(stream, 64*1024))
+	if len(raw) != 0 {
+		t.Fatalf("空白名单必须拒绝已认证 secp256k1 客户端，实际返回 %q", string(raw))
 	}
-	if diag["remote_peer_id"] != clientID.String() {
-		t.Fatalf("NAS observed remote peer %v, want %s", diag["remote_peer_id"], clientID)
-	}
+	_ = clientID
 }
 
 func TestEmptyWhitelistStillRejectsNonSecp256k1Client(t *testing.T) {
@@ -307,7 +304,7 @@ func TestEmptyWhitelistStillRejectsNonSecp256k1Client(t *testing.T) {
 	}
 	raw, _ := io.ReadAll(io.LimitReader(stream, 64*1024))
 	if len(raw) != 0 {
-		t.Fatalf("demo allow-all must reject non-secp256k1 client, got %q", string(raw))
+		t.Fatalf("空白名单必须拒绝非 secp256k1 客户端，实际返回 %q", string(raw))
 	}
 }
 

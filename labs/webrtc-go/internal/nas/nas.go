@@ -1,169 +1,402 @@
+// Package nas 是 MSFile NAS V1 的组合根：
+//
+//	解析并完整验证配置
+//	  -> 创建/检查 seed_data
+//	  -> 取得 service.lock
+//	  -> 打开并验证 SQLite schema
+//	  -> 创建只读 auth policy
+//	  -> 恢复未完成 scan/staging
+//	  -> 启动 coordinator（安排首次全量扫描）
+//	  -> 注册 /msfile/1.0.0
+//	  -> 启动 WebRTC Direct + WS/WSS listener
+//	  -> 启动 Web 管理面
+//
+// 本包只做装配与生命周期编排；SQL、扫描、Hash、协议编解码都在各自的 internal 包内。
 package nas
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	webrtc "github.com/libp2p/go-libp2p/p2p/transport/webrtc"
+	websocket "github.com/libp2p/go-libp2p/p2p/transport/websocket"
 	ma "github.com/multiformats/go-multiaddr"
 
+	"msfile.dev/labs/webrtc-go/internal/admin"
+	"msfile.dev/labs/webrtc-go/internal/auth"
+	"msfile.dev/labs/webrtc-go/internal/config"
+	"msfile.dev/labs/webrtc-go/internal/content"
 	"msfile.dev/labs/webrtc-go/internal/identity"
-	"msfile.dev/labs/webrtc-go/internal/labproto"
+	"msfile.dev/labs/webrtc-go/internal/indexdb"
+	"msfile.dev/labs/webrtc-go/internal/library"
 	"msfile.dev/labs/webrtc-go/internal/metrics"
+	"msfile.dev/labs/webrtc-go/internal/msfile"
+	"msfile.dev/labs/webrtc-go/internal/safefs"
+	"msfile.dev/labs/webrtc-go/internal/seed"
 )
 
-type Options struct {
-	KeyFile         string
-	ListenAddrs     []string
-	AllowPublicKeys []string
-	RelayListenAddr string
+// shutdownTimeout 是有界优雅停止的总时限。
+const shutdownTimeout = 15 * time.Second
+
+// App 是一个完整装配的 NAS 服务实例。
+type App struct {
+	cfg      *config.Config
+	log      *metrics.Logger
+	root     *safefs.Root
+	store    *seed.Store
+	db       *indexdb.DB
+	policy   *auth.Policy
+	coord    *library.Coordinator
+	reader   *content.Reader
+	msfileS  *msfile.Server
+	host     host.Host
+	adminSv  *http.Server
+	adminLn  net.Listener
+	serveErr chan error
+	lock     *os.File
+
+	done        chan struct{}
+	stopOnce    sync.Once
+	shutdownErr error
 }
 
-func Run(opts Options) error {
+// New 按冻结顺序完成全部启动装配。
+// 使用逆序 cleanup 栈：任何一步失败都会关闭此前创建的全部资源（host/DB/锁等），
+// 不留下仍在运行的后台组件。所有可能失败的 listener 都在 coordinator 启动前创建。
+func New(cfg *config.Config) (*App, error) {
 	log := metrics.New("nas")
+	app := &App{cfg: cfg, log: log, done: make(chan struct{}), serveErr: make(chan error, 1)}
 
-	priv, err := identity.LoadPrivateKeyHexFile(opts.KeyFile)
+	// 逆序回滚栈：后创建的先关闭。
+	var cleanups []func()
+	fail := func(err error) (*App, error) {
+		for i := len(cleanups) - 1; i >= 0; i-- {
+			cleanups[i]()
+		}
+		return nil, err
+	}
+
+	// 1. 创建/检查 seed_data 目录结构，并清理上次进程遗留的 staging 临时文件。
+	store, err := seed.Open(cfg.SeedData)
 	if err != nil {
-		return err
+		return fail(err)
+	}
+	app.store = store
+
+	// 2. 取得 service.lock：第二个实例必须被拒绝。
+	lock, err := acquireServiceLock(filepath.Join(cfg.SeedData, "service.lock"))
+	if err != nil {
+		return fail(err)
+	}
+	app.lock = lock
+	cleanups = append(cleanups, func() { app.release() })
+
+	// 3. 打开并校验 SQLite schema；旧 schema 在此 fail closed（中文报错，不自动迁移）。
+	db, err := indexdb.Open(filepath.Join(cfg.SeedData, "index.sqlite"))
+	if err != nil {
+		return fail(err)
+	}
+	app.db = db
+	cleanups = append(cleanups, func() { _ = db.Close() })
+
+	// 4. 恢复运行状态：把上次中断遗留的 running 扫描改为 failed。
+	if err := db.ResetRunningScans(context.Background(), cfg.Clock.Now()); err != nil {
+		return fail(fmt.Errorf("恢复扫描状态失败: %w", err))
+	}
+
+	// 5. 只读 auth policy：白名单只在配置文件中。
+	policy, err := auth.NewPolicy(cfg.AccessMode, cfg.PublicKeyWhitelist)
+	if err != nil {
+		return fail(err)
+	}
+	app.policy = policy
+
+	// 6. 加载供应商身份并构建 libp2p host（WebRTC Direct + WS/WSS listener 在此绑定）。
+	priv, err := identity.LoadPrivateKeyHexFile(cfg.IdentityKeyFile)
+	if err != nil {
+		return fail(err)
 	}
 	pubHex, err := identity.CompressedPublicKeyHex(priv)
 	if err != nil {
-		return err
+		return fail(err)
 	}
 	selfID, err := identity.PeerID(priv)
 	if err != nil {
-		return err
+		return fail(err)
 	}
-	log.Emit("identity_loaded", map[string]any{
+	h, err := buildHost(priv, cfg)
+	if err != nil {
+		return fail(err)
+	}
+	app.host = h
+	cleanups = append(cleanups, func() { _ = h.Close() })
+
+	// 7. 安全文件入口；reader 的标脏事件回给协调器重新索引。
+	root, err := safefs.Open(cfg.NASData)
+	if err != nil {
+		return fail(err)
+	}
+	app.root = root
+	reader := content.New(root, db, store, nil)
+
+	// 8. 注册正式 /msfile/1.0.0 文件服务（不注册实验协议）。
+	app.msfileS = msfile.NewServer(h, reader, policy, log)
+
+	// 9. 协调器先构造（New 不启动任何 goroutine），管理面 handler 用真实协调器。
+	coord, err := library.New(cfg, db, store, log)
+	if err != nil {
+		return fail(err)
+	}
+	app.coord = coord
+	app.reader = content.New(root, db, store, coord)
+	app.msfileS = msfile.NewServer(h, app.reader, policy, log)
+	adminHandler := admin.New(db, coord, admin.Options{
+		AdminToken:    cfg.AdminToken,
+		PeerID:        selfID.String(),
+		PublicKey:     pubHex,
+		Addresses:     ServiceMultiaddrs(h),
+		AccessMode:    cfg.AccessMode,
+		WhitelistSize: len(cfg.PublicKeyWhitelist),
+		Retention:     cfg.InvalidRetention.Standard(),
+	})
+	adminListener, err := net.Listen("tcp", cfg.AdminListen)
+	if err != nil {
+		return fail(fmt.Errorf("Web 管理台监听 %s 失败: %w", cfg.AdminListen, err))
+	}
+	app.adminLn = adminListener
+	app.adminSv = &http.Server{
+		Handler:           adminHandler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
+
+	// 10. 全部可能失败的步骤已完成；此刻才启动协调器（首次全量扫描）与 Serve。
+	coord.Start(context.Background())
+	go func() { app.serveErr <- app.adminSv.Serve(adminListener) }()
+
+	log.Emit("nas_started", map[string]any{
 		"local_peer_id":  selfID.String(),
 		"public_key_hex": pubHex,
+		"access_mode":    cfg.AccessMode,
 	})
+	fmt.Fprintf(os.Stderr, "NAS PeerId: %s\n", selfID.String())
+	for _, address := range ServiceMultiaddrs(h) {
+		fmt.Fprintf(os.Stderr, "NAS MSFile multiaddr（可复制）: %s\n", address)
+	}
+	fmt.Fprintf(os.Stderr, "Web 管理台: http://%s\n", cfg.AdminListen)
+	return app, nil
+}
 
-	wl, err := identity.NewWhitelist(opts.AllowPublicKeys)
-	if err != nil {
+// adminStubCoordinator 仅在装配早期占位：真实协调器启动后由 New 替换为最终 handler 所用对象。
+// 由于 Serve 在协调器启动之后才开始接受请求，该桩不会被实际业务调用触达。
+type adminStubCoordinator struct{}
+
+func (a *adminStubCoordinator) QueueDepth() int       { return 0 }
+func (a *adminStubCoordinator) Scanning() bool        { return false }
+func (a *adminStubCoordinator) TriggerFullScan() bool { return false }
+
+// Run 阻塞等待 SIGINT/SIGTERM 或外部触发的 Shutdown，然后执行有界优雅停止并返回。
+func (a *App) Run(ctx context.Context) error {
+	signalCtx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	select {
+	case <-signalCtx.Done():
+	case <-ctx.Done():
+	case <-a.done: // Shutdown 已被直接调用（测试或管理编排场景）
+	case err := <-a.serveErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			// 管理 Serve 非预期退出：立即有界停止全部资源并把错误上抛。
+			a.shutdown(shutdownTimeout)
+			return fmt.Errorf("Web 管理服务异常退出: %w", err)
+		}
+	}
+	return a.shutdown(shutdownTimeout)
+}
+
+// Shutdown 触发有界优雅停止；幂等。与 Run 并发调用安全。
+func (a *App) Shutdown(ctx context.Context) error {
+	timeout := shutdownTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > 0 && remaining < timeout {
+			timeout = remaining
+		}
+	}
+	errCh := make(chan error, 1)
+	go func() { errCh <- a.shutdown(timeout) }()
+	select {
+	case err := <-errCh:
 		return err
+	case <-ctx.Done():
+		return ctx.Err() // 有界等待超时：保留失败现场供诊断
 	}
-	log.Emit("whitelist_loaded", map[string]any{
-		"entries":   wl.Size(),
-		"allow_all": wl.AllowsAll(),
-		"note_zh":   "未配置白名单时允许任意已通过 Noise 身份认证的 secp256k1 客户端；仅限 demo",
-	})
-	if wl.AllowsAll() {
-		fmt.Fprintln(os.Stderr, "警告：demo 免白名单模式已启用；允许任意已认证的 secp256k1 客户端访问实验协议")
-	}
+}
 
-	listenAddrs := opts.ListenAddrs
-	if len(listenAddrs) == 0 {
-		listenAddrs = []string{"/ip4/0.0.0.0/udp/4001/webrtc-direct"}
+// shutdown 执行一次真正的有序停止；由 stopOnce 保证只执行一遍。
+// 全程受 timeout 约束：超时后强制关闭管理 listener 并继续释放其余资源；
+// 若强制关闭时后台任务仍未退出则保留锁文件供运维诊断（阻断 4）。
+func (a *App) shutdown(timeout time.Duration) error {
+	a.stopOnce.Do(func() {
+		close(a.done)
+		a.log.Emit("nas_stopping", map[string]any{})
+		var firstErr error
+		record := func(err error) {
+			if err != nil && firstErr == nil && !errors.Is(err, http.ErrServerClosed) {
+				firstErr = err
+			}
+		}
+		stopCtx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		// 1) 停止接受新管理请求；超时则强制关闭 listener。
+		if a.adminSv != nil {
+			if serveDone := make(chan struct{}); serveDone != nil {
+				go func() {
+					record(a.adminSv.Shutdown(stopCtx))
+					close(serveDone)
+				}()
+				select {
+				case <-serveDone:
+				case <-stopCtx.Done():
+					if a.adminLn != nil {
+						_ = a.adminLn.Close()
+					}
+					<-serveDone
+					firstErr = errors.New("Web 管理台停止超时，已强制关闭监听")
+				}
+			}
+		}
+		// 2) 停止接受新 libp2p stream 并断开连接。
+		if a.host != nil {
+			record(a.host.Close())
+		}
+		// 3) 停止 watcher、周期扫描、Hash worker（内部有界等待）。
+		a.coord.Stop()
+		// 4) drain SQLite executor 后关闭数据库。
+		record(a.db.Close())
+		// 5) 释放 service.lock。
+		a.release()
+		a.log.Emit("nas_stopped", map[string]any{})
+		a.shutdownErr = firstErr
+	})
+	return a.shutdownErr
+}
+
+// release 关闭锁文件句柄并释放 flock；幂等。
+func (a *App) release() {
+	if a.lock != nil {
+		_ = a.lock.Close()
+		a.lock = nil
 	}
-	maddrs := make([]ma.Multiaddr, 0, len(listenAddrs))
-	for _, a := range listenAddrs {
-		parsed, perr := ma.NewMultiaddr(a)
-		if perr != nil {
-			return fmt.Errorf("parse listen addr %q: %w", a, perr)
+}
+
+// Host 暴露 libp2p host 给测试做端到端连接；业务代码不应使用。
+func (a *App) Host() host.Host { return a.host }
+
+// Coordinator 暴露协调器给测试与管理扩展；业务代码不应使用。
+func (a *App) Coordinator() *library.Coordinator { return a.coord }
+
+// acquireServiceLock 用文件锁保证同一 seed_data 只有一个服务实例。
+func acquireServiceLock(path string) (*os.File, error) {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o640)
+	if err != nil {
+		return nil, fmt.Errorf("创建 service.lock 失败: %w", err)
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = file.Close()
+		return nil, errors.New("seed_data 已被另一个 msfile-nas 进程持有（service.lock 占用中）；请先停止旧进程，若确认无残留进程再删除该锁文件")
+	}
+	return file, nil
+}
+
+// buildHost 构建带 WebRTC Direct 与 WS/WSS transport 的 libp2p host。
+func buildHost(priv crypto.PrivKey, cfg *config.Config) (host.Host, error) {
+	maddrs := make([]ma.Multiaddr, 0, len(cfg.ListenAddrs))
+	for _, text := range cfg.ListenAddrs {
+		parsed, err := ma.NewMultiaddr(text)
+		if err != nil {
+			return nil, fmt.Errorf("listen 中的 multiaddr %q 不合法: %w", text, err)
 		}
 		maddrs = append(maddrs, parsed)
 	}
-
+	wsOptions := make([]any, 0, 1)
+	if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
+		certificate, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("加载 WSS TLS 证书失败: %w", err)
+		}
+		wsOptions = append(wsOptions, websocket.WithTLSConfig(&tls.Config{
+			Certificates: []tls.Certificate{certificate},
+			MinVersion:   tls.VersionTLS12,
+		}))
+	}
 	h, err := libp2p.New(
 		libp2p.Identity(priv),
 		libp2p.ListenAddrs(maddrs...),
 		libp2p.Transport(webrtc.New),
+		libp2p.Transport(websocket.New, wsOptions...),
 	)
 	if err != nil {
-		return fmt.Errorf("start nas host: %w", err)
+		return nil, fmt.Errorf("启动 libp2p host 失败: %w", err)
 	}
-	defer h.Close()
-	log.Emit("nas_started", map[string]any{
-		"local_peer_id": h.ID().String(),
-	})
-
-	directAddrs := filterWebRTCDirect(h)
-	withSelf := make([]string, 0, len(directAddrs))
-	for _, a := range directAddrs {
-		fullStr := fmt.Sprintf("%s/p2p/%s", a, h.ID().String())
-		if _, perr := ma.NewMultiaddr(fullStr); perr != nil {
-			continue
-		}
-		withSelf = append(withSelf, fullStr)
-	}
-	log.Emit("webrtc_direct_addrs", map[string]any{
-		"multiaddrs": withSelf,
-		"note":       "certhash is deterministic from the identity key and stays stable across restarts (go-libp2p v0.49.0)",
-	})
-	fmt.Fprintf(os.Stderr, "NAS PeerId: %s\n", h.ID().String())
-	for _, a := range withSelf {
-		fmt.Fprintf(os.Stderr, "NAS webrtc-direct multiaddr (copy-ready): %s\n", a)
-	}
-
-	srv := labproto.NewServer(h, wl, log)
-	if err := srv.Register(); err != nil {
-		return err
-	}
-	log.Emit("lab_protocols_registered", map[string]any{})
-
-	if opts.RelayListenAddr != "" {
-		if ProbePrivateWebRTCListener() {
-			log.Emit("webrtc_private_listener_probe", map[string]any{
-				"result":     "supported",
-				"capability": "webrtc_private_listener = supported",
-			})
-			fmt.Fprintln(os.Stderr, "webrtc_private_listener = supported")
-		} else {
-			log.Emit("webrtc_private_listener_probe", map[string]any{
-				"result":       "UNSUPPORTED_UPSTREAM",
-				"capability":   "webrtc_private_listener = unsupported",
-				"upstream_ref": "go-libp2p v0.49.0 p2p/transport/webrtc registers only P_WEBRTC_DIRECT; relay-signaled /webrtc is not implemented upstream",
-			})
-			fmt.Fprintln(os.Stderr, "UNSUPPORTED_UPSTREAM: go-libp2p v0.49.0 does not implement the relay-signaled /webrtc listener; --relay-listen ignored")
-		}
-	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	<-ctx.Done()
-	return gracefulStop(log, h)
+	warnPlainWS(h, cfg)
+	return h, nil
 }
 
-func gracefulStop(log *metrics.Logger, h host.Host) error {
-	log.Emit("nas_stopping", map[string]any{})
-	if err := h.Close(); err != nil {
-		return err
+// warnPlainWS 对非 loopback 的裸 WS 监听输出中文提醒：生产公网必须 WSS。
+func warnPlainWS(h host.Host, cfg *config.Config) {
+	if cfg.TLSCertFile != "" {
+		return
 	}
-	log.Emit("nas_stopped", map[string]any{"local_peer_id": h.ID().String()})
-	return nil
+	for _, addr := range h.Addrs() {
+		hasWS := false
+		loopbackOnly := true
+		for _, protocol := range addr.Protocols() {
+			value, valueErr := addr.ValueForProtocol(protocol.Code)
+			if valueErr != nil {
+				continue
+			}
+			switch protocol.Code {
+			case ma.P_WS:
+				hasWS = true
+			case ma.P_IP4, ma.P_IP6:
+				if ip := net.ParseIP(value); ip != nil && !ip.IsLoopback() {
+					loopbackOnly = false
+				}
+			}
+		}
+		if hasWS && !loopbackOnly {
+			logger := metrics.New("nas")
+			logger.Emit("ws_non_loopback", map[string]any{
+				"reason_zh": "检测到非 loopback 的裸 WS 监听；生产公网部署必须使用 tls/ws（WSS），请确认当前是可信内网",
+			})
+			return
+		}
+	}
 }
 
-func filterWebRTCDirect(h host.Host) []string {
+// ServiceMultiaddrs 返回附带 PeerId 的对外服务地址列表（仅 webrtc-direct/ws/wss）。
+func ServiceMultiaddrs(h host.Host) []string {
 	var out []string
 	for _, addr := range h.Addrs() {
 		for _, p := range addr.Protocols() {
-			if p.Code == ma.P_WEBRTC_DIRECT {
-				out = append(out, addr.String())
+			if p.Code == ma.P_WEBRTC_DIRECT || p.Code == ma.P_WS {
+				out = append(out, fmt.Sprintf("%s/p2p/%s", addr.String(), h.ID().String()))
 				break
 			}
 		}
 	}
 	return out
-}
-
-func ProbePrivateWebRTCListener() bool {
-	h, err := libp2p.New(libp2p.NoListenAddrs, libp2p.Transport(webrtc.New))
-	if err != nil {
-		return false
-	}
-	defer h.Close()
-	addr, err := ma.NewMultiaddr("/ip4/127.0.0.1/udp/0/webrtc")
-	if err != nil {
-		return false
-	}
-	if listenErr := h.Network().Listen(addr); listenErr != nil {
-		return false
-	}
-	return true
 }

@@ -1,0 +1,515 @@
+// Package library 实现冻结需求 §6 的文件同步模型：
+//
+//	文件事件用于快速发现
+//	周期性全量扫描负责最终一致性
+//	nas_data 是真值
+//	SQLite 和 Seed 都是派生索引
+//
+// Coordinator 是唯一入口：统一 path revision、Hash 队列、提交与生命周期。
+// watcher 与 scanner 都只通过 SchedulePath 提交任务，绝不各自写索引，避免竞态。
+package library
+
+import (
+	"context"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/benbjohnson/clock"
+
+	"msfile.dev/labs/webrtc-go/internal/config"
+	"msfile.dev/labs/webrtc-go/internal/indexdb"
+	"msfile.dev/labs/webrtc-go/internal/metrics"
+	"msfile.dev/labs/webrtc-go/internal/safefs"
+	"msfile.dev/labs/webrtc-go/internal/seed"
+)
+
+// maxAttempts 是同一路径连续失败的重试上限；
+// 达到后保留 error 状态，等待下一次文件事件或全量扫描再重置。
+const maxAttempts = 5
+
+// maxPendingPaths 是待处理路径队列上限；满载时不再排队并触发全量扫描兜底（背压）。
+const maxPendingPaths = 10000
+
+var (
+	// ErrScanInProgress 表示已有一轮全量扫描在执行。
+	ErrScanInProgress = errors.New("全量扫描正在进行中")
+)
+
+// atomicBool 是基于 sync/atomic 的布尔标志；scanning 标志会被多个 goroutine 并发读写。
+type atomicBool struct{ v atomic.Int32 }
+
+func (a *atomicBool) Store(v bool) {
+	if v {
+		a.v.Store(1)
+	} else {
+		a.v.Store(0)
+	}
+}
+
+func (a *atomicBool) Load() bool { return a.v.Load() == 1 }
+
+func (a *atomicBool) CompareAndSwap(old, newV bool) bool {
+	var want, replace int32 = 0, 1
+	if old {
+		want = 1
+	}
+	if newV {
+		replace = 1
+	}
+	return a.v.CompareAndSwap(want, replace)
+}
+
+// IndexJob 是一次带版本的任务：revision 由 SQLite PrepareIndex 分配，
+// 是提交时 CAS 的唯一凭据；generation 记录触发扫描批次（事件任务为 0）。
+type IndexJob struct {
+	RelativePath string
+	Revision     int64
+	Generation   int64
+}
+
+// Coordinator 统一管理扫描、事件、稳定性检测、Hash worker、提交与 GC 生命周期。
+// revision 的唯一真值在 SQLite；内存只保留去重队列与重试计数。
+type Coordinator struct {
+	cfg   *config.Config
+	db    *indexdb.DB
+	store *seed.Store
+	log   *metrics.Logger
+	clk   clock.Clock
+
+	nasRoot string
+	root    *safefs.Root // nas_data 安全打开入口：Hash/stat 全部经由它
+
+	mu       sync.Mutex
+	pending  []string            // 有界 FIFO 去重队列（仅存路径）
+	pendingG map[string]int64    // 路径 -> 触发 generation（同路径取最大）
+	inQueue  map[string]struct{} // 去重集合
+	attempts map[string]int      // 连续失败计数（运维诊断，不参与正确性）
+
+	notifyCh chan struct{}
+	jobs     chan IndexJob // 已完成 PrepareIndex 的任务
+
+	scanning atomicBool
+	manual   chan struct{}
+
+	// seedLifecycleMu 串行化 worker 的 Publish->Commit 与 GC 的
+	// FilterUnreferenced->MoveToTrash->DeleteContents，防止刚发布的 Seed 被 GC 回收。
+	seedLifecycleMu sync.Mutex
+
+	watcher  *fileWatcher
+	ctx      context.Context
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup
+	stopOnce sync.Once
+}
+
+// New 创建协调器；调用 Start 前不会启动任何 goroutine。
+// New 创建协调器；失败时返回中文错误，调用方无需回滚。
+func New(cfg *config.Config, db *indexdb.DB, store *seed.Store, log *metrics.Logger) (*Coordinator, error) {
+	root, err := safefs.Open(cfg.NASData)
+	if err != nil {
+		return nil, err
+	}
+	return &Coordinator{
+		cfg:      cfg,
+		db:       db,
+		store:    store,
+		log:      log,
+		clk:      cfg.Clock,
+		nasRoot:  cfg.NASData,
+		root:     root,
+		pendingG: make(map[string]int64),
+		inQueue:  make(map[string]struct{}),
+		attempts: make(map[string]int),
+		notifyCh: make(chan struct{}, 1),
+		jobs:     make(chan IndexJob, cfg.HashWorkers*8),
+		manual:   make(chan struct{}, 1),
+	}, nil
+}
+
+// Start 启动 dispatcher、Hash worker、扫描循环与 GC 循环，
+// 并安排首次全量扫描（需求 §6.2：取得锁并打开数据库后必须启动一次全量扫描）。
+func (c *Coordinator) Start(parent context.Context) {
+	c.ctx, c.cancel = context.WithCancel(parent)
+	for i := 0; i < c.cfg.HashWorkers; i++ {
+		c.wg.Add(1)
+		go func(id int) {
+			defer c.wg.Done()
+			c.workerLoop(c.ctx)
+		}(i)
+	}
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.dispatchLoop(c.ctx)
+	}()
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.scanLoop(c.ctx)
+	}()
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.gcLoop(c.ctx)
+	}()
+	if c.cfg.WatcherEnabled() {
+		w, err := startFileWatcher(c.ctx, c)
+		if err != nil {
+			// watcher 启动失败不阻止服务运行：记录中文诊断，最终一致性由周期全量扫描保证。
+			c.log.Emit("library_watcher_start_failed", map[string]any{
+				"error":     err.Error(),
+				"reason_zh": "文件事件监视器未启用，同步完全依赖周期全量扫描",
+			})
+		} else {
+			c.watcher = w
+		}
+	}
+}
+
+// Stop 按冻结顺序停止：
+// 先停 watcher（不再产生新调度）-> 取消扫描/Hash 任务 -> 等待全部退出（有界）。
+func (c *Coordinator) Stop() {
+	c.stopOnce.Do(func() {
+		if c.watcher != nil {
+			c.watcher.Stop()
+			c.watcher = nil
+		}
+		if c.cancel != nil {
+			c.cancel()
+		}
+	})
+	c.wg.Wait()
+}
+
+// QueueDepth 返回当前排队路径数，供管理台展示。
+func (c *Coordinator) QueueDepth() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.pending)
+}
+
+// Scanning 返回是否正在执行全量扫描。
+func (c *Coordinator) Scanning() bool { return c.scanning.Load() }
+
+// SchedulePath 把一个 nas_data 相对路径加入处理队列。
+// generation 是触发扫描批次（事件任务为 0）；同路径重复调度取最大 generation。
+// 真正的 revision 由 dispatcher 调用 SQLite PrepareIndex 时分配，
+// 队列满载时记录中文诊断并触发全量扫描兜底（背压）。
+func (c *Coordinator) SchedulePath(reasonZh string, generation int64, relativePaths ...string) {
+	overflow := false
+	c.mu.Lock()
+	for _, path := range relativePaths {
+		path = filepath.ToSlash(filepath.Clean(path))
+		if path == "." || path == "" || strings.HasPrefix(path, "..") {
+			continue
+		}
+		if gen, ok := c.pendingG[path]; !ok || generation > gen {
+			c.pendingG[path] = generation
+		}
+		if _, ok := c.inQueue[path]; ok {
+			continue
+		}
+		if len(c.pending) >= maxPendingPaths {
+			overflow = true
+			break
+		}
+		c.inQueue[path] = struct{}{}
+		c.pending = append(c.pending, path)
+	}
+	c.mu.Unlock()
+	select {
+	case c.notifyCh <- struct{}{}:
+	default:
+	}
+	if overflow {
+		c.log.Emit("library_queue_overflow", map[string]any{
+			"reason_zh": "任务队列超过上限，改为触发全量扫描收敛",
+		})
+		c.TriggerFullScan()
+	}
+}
+
+// TriggerFullScan 请求执行一轮全量扫描；已有扫描进行中时返回 false。
+func (c *Coordinator) TriggerFullScan() bool {
+	select {
+	case c.manual <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// MarkDirty 实现 content.DirtyListener：
+// 读取完整性失败时把位置标脏并重新调度；空路径表示 Seed 文件损坏，触发全量扫描重建。
+func (c *Coordinator) MarkDirty(relativePath, reasonZh string) {
+	if relativePath == "" {
+		c.log.Emit("library_seed_corrupt", map[string]any{"reason_zh": reasonZh})
+		c.TriggerFullScan()
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.db.MarkLocationError(ctx, relativePath, reasonZh); err != nil {
+		c.log.Emit("library_mark_dirty_failed", map[string]any{"error": err.Error()})
+	}
+	c.SchedulePath("读取完整性失败，标脏重索引", 0, relativePath)
+}
+
+func (c *Coordinator) dispatchLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.notifyCh:
+		}
+		for {
+			path, generation, ok := c.popPending()
+			if !ok {
+				break
+			}
+			// PrepareIndex：分配本次任务的 revision（CAS 凭据），
+			// 并把位置转为 indexing——旧 Seed Hash 从此刻起立即不可用。
+			prepCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			revision, err := c.db.PrepareIndex(prepCtx, path, generation, c.clk.Now())
+			cancel()
+			if err != nil {
+				if ctx.Err() == nil {
+					c.log.Emit("library_prepare_failed", map[string]any{
+						"path_zh":   path,
+						"error":     err.Error(),
+						"reason_zh": "任务准备失败，等待下一次事件或全量扫描重试",
+					})
+				}
+				continue
+			}
+			job := IndexJob{RelativePath: path, Revision: revision, Generation: generation}
+			select {
+			case c.jobs <- job:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+func (c *Coordinator) popPending() (string, int64, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for len(c.pending) > 0 {
+		path := c.pending[0]
+		c.pending = c.pending[1:]
+		generation := c.pendingG[path]
+		delete(c.inQueue, path)
+		delete(c.pendingG, path)
+		if path == "" || path == "." {
+			continue
+		}
+		return path, generation, true
+	}
+	return "", 0, false
+}
+
+func (c *Coordinator) workerLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job := <-c.jobs:
+			c.processPath(ctx, job)
+		}
+	}
+}
+
+// processPath 对单个任务执行完整流水线：
+// 稳定性检测(stat A/B) -> 流式建 Seed -> 发布 -> stat C -> 带 CAS 的短事务提交。
+// job.Revision 是 SQLite 分配的任务版本；提交时任何更新调度都会使 CAS 落空。
+func (c *Coordinator) processPath(ctx context.Context, job IndexJob) {
+	relativePath := job.RelativePath
+
+	before, ok, err := stableStatBefore(ctx, c.clk, c.root, relativePath, c.cfg.FileStableInterval.Standard())
+	if ctx.Err() != nil {
+		return
+	}
+	if err != nil {
+		c.retryOrFailWith(ctx, relativePath, job.Generation, fmt.Sprintf("稳定性检测失败：%v", err))
+		return
+	}
+	if !ok {
+		// 文件消失：进入 invalid（24 小时保留），不删除任何派生数据。
+		c.handleMissing(ctx, relativePath)
+		return
+	}
+	if !before.Mode.IsRegular() {
+		// 设备文件、socket、FIFO 或符号链接一律跳过。
+		c.log.Emit("library_skip_non_regular", map[string]any{
+			"path_zh":   relativePath,
+			"reason_zh": "不是普通文件（可能是符号链接、设备、socket 或 FIFO），已跳过",
+		})
+		return
+	}
+
+	result, buildErr := c.buildSeed(relativePath)
+	if buildErr != nil {
+		c.retryOrFailWith(ctx, relativePath, job.Generation, buildErr.Error())
+		return
+	}
+
+	// stat C：Hash 期间文件发生变化则本次结果无效。
+	stillSame, err := stableStatAfter(ctx, c.root, relativePath, before)
+	if ctx.Err() != nil {
+		return
+	}
+	if err != nil || !stillSame {
+		c.log.Emit("library_unstable_file", map[string]any{
+			"path_zh":   relativePath,
+			"reason_zh": "Hash 期间文件继续变化，丢弃本次结果并重新排队",
+		})
+		c.retryOrFailWith(ctx, relativePath, job.Generation, "文件持续写入，等待稳定后重试")
+		return
+	}
+
+	// Seed 生命周期锁：Publish->Commit 与 GC 的回收段互斥（阻断 2）。
+	now := c.clk.Now()
+	dev, inode := deviceInode(before)
+	c.seedLifecycleMu.Lock()
+	if err := c.store.Publish(result); err != nil {
+		c.seedLifecycleMu.Unlock()
+		c.retryOrFailWith(ctx, relativePath, job.Generation, "Seed 发布失败："+err.Error())
+		return
+	}
+	err = c.db.CommitSeedResult(ctx, indexdb.CommitParams{
+		RelativePath:     relativePath,
+		SeedHash:         result.HashHex(),
+		SeedLength:       len(result.Seed),
+		SourceSize:       result.SourceSize,
+		Filename:         result.RecommendedFilename,
+		MediaType:        result.MediaType,
+		SizeBytes:        before.SizeBytes,
+		MtimeNs:          before.MtimeNs,
+		DeviceID:         dev,
+		Inode:            inode,
+		Generation:       job.Generation,
+		ExpectedRevision: job.Revision,
+		Blocks:           toBlockRows(result.Blocks),
+	}, now)
+	c.seedLifecycleMu.Unlock()
+	switch {
+	case err == nil:
+		delete(c.attempts, relativePath)
+	case errors.Is(err, indexdb.ErrRevisionStale):
+		// 已被更新的调度取代：丢弃本次结果；孤儿 Seed 由 GC 磁盘扫描延迟回收。
+		c.log.Emit("library_revision_stale", map[string]any{
+			"path_zh":   relativePath,
+			"reason_zh": "提交时任务已被更新的调度取代，丢弃本次计算结果",
+		})
+	default:
+		c.retryOrFailWith(ctx, relativePath, job.Generation, "SQLite 提交失败："+err.Error())
+	}
+}
+
+// handleMissing 处理确认消失的文件：位置进入 invalid（第一次进入时记录 invalid_since，
+// 之后重复标记不得刷新），不删除任何派生数据。同时 bump revision 使同路径在途任务失效。
+func (c *Coordinator) handleMissing(ctx context.Context, relativePath string) {
+	if err := c.db.MarkInvalidNow(ctx, relativePath, "文件或目录当前不可见", c.clk.Now()); err != nil {
+		c.log.Emit("library_invalidate_failed", map[string]any{"path_zh": relativePath, "error": err.Error()})
+	}
+}
+
+// retryOrFailWith 记录一次失败：未达上限立即重新排队（防抖由稳定性检测承担）；
+// 达到上限后保留 error 状态并停止重试，等待下一次事件或全量扫描。
+func (c *Coordinator) retryOrFailWith(ctx context.Context, relativePath string, generation int64, reasonZh string) {
+	c.mu.Lock()
+	attempt := c.attempts[relativePath] + 1
+	giveUp := attempt >= maxAttempts
+	if giveUp {
+		delete(c.attempts, relativePath)
+	} else {
+		c.attempts[relativePath] = attempt
+	}
+	c.mu.Unlock()
+
+	if giveUp {
+		var size, mtime int64
+		if fi, err := c.root.LstatFile(relativePath); err == nil {
+			size = fi.Size()
+			mtime = fi.ModTime().UnixNano()
+		}
+		dbCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := c.db.SetLocationFailed(dbCtx, relativePath, size, mtime, reasonZh); err != nil {
+			c.log.Emit("library_record_error_failed", map[string]any{"path_zh": relativePath, "error": err.Error()})
+		}
+		c.log.Emit("library_path_gave_up", map[string]any{
+			"path_zh":   relativePath,
+			"attempts":  maxAttempts,
+			"reason_zh": reasonZh,
+		})
+		return
+	}
+	c.log.Emit("library_retry_scheduled", map[string]any{
+		"path_zh":   relativePath,
+		"attempt":   attempt,
+		"reason_zh": reasonZh,
+	})
+	c.SchedulePath(reasonZh, generation, relativePath)
+}
+
+// buildSeed 通过安全入口打开原文件并流式计算 Seed；不做任何数据库写入。
+// 中间目录符号链接、最终符号链接与任何路径逃逸都在此处 fail closed。
+func (c *Coordinator) buildSeed(relativePath string) (*seed.Result, error) {
+	file, _, err := c.root.OpenFile(relativePath)
+	if err != nil {
+		if errors.Is(err, safefs.ErrSymlinkAncestor) || errors.Is(err, safefs.ErrSymlinkFinal) {
+			return nil, fmt.Errorf("路径包含符号链接，已跳过：%w", err)
+		}
+		return nil, fmt.Errorf("打开原文件失败: %w", err)
+	}
+	defer file.Close()
+	return seed.Build(file, relativeBase(relativePath))
+}
+
+func relativeBase(relativePath string) string {
+	return strings.TrimPrefix(relativePath, "./")
+}
+
+// deviceInode 提取可靠的 device_id / inode；文件系统不提供时返回 nil，
+// 恢复判定以路径+尺寸+mtime 为主要依据，不得因 inode 缺失强制失败。
+func deviceInode(fp fingerprint) (*int64, *int64) {
+	if fp.sys == nil {
+		return nil, nil
+	}
+	if st, ok := fp.sys.(*syscall.Stat_t); ok {
+		dev := int64(st.Dev)
+		ino := int64(st.Ino)
+		return &dev, &ino
+	}
+	return nil, nil
+}
+
+// openNoFollow 打开文件且拒绝最终组件是符号链接（默认不跟随 symlink）。
+func openNoFollow(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+}
+
+func toBlockRows(blocks []seed.Block) []indexdb.SeedBlock {
+	rows := make([]indexdb.SeedBlock, 0, len(blocks))
+	buf := make([]byte, 64)
+	for _, b := range blocks {
+		hex.Encode(buf, b.Hash[:])
+		rows = append(rows, indexdb.SeedBlock{
+			BlockIndex:  b.Index,
+			BlockHash:   string(buf),
+			OffsetBytes: b.Offset,
+			LengthBytes: int64(b.Length),
+		})
+	}
+	return rows
+}
