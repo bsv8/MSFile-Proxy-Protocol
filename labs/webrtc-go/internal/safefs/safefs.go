@@ -116,7 +116,10 @@ func (r *Root) ensureLocked() (innerReady bool, err error) {
 	}
 	fi, fiErr := os.Stat(r.dir)
 	if fiErr != nil {
-		r.inner = nil
+		if r.inner != nil {
+			_ = r.inner.Close()
+			r.inner = nil
+		}
 		return false, fiErr // 当前不可见：调用方按文件不可见路径处理
 	}
 	st, ok := fi.Sys().(*syscall.Stat_t)

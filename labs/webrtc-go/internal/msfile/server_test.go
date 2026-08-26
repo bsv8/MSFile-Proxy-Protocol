@@ -19,6 +19,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -638,10 +639,10 @@ func TestStreamRebuildKeepsRequestIDMonotonic(t *testing.T) {
 	}
 
 	var fields2 []any
-	deadlineRetry := time.Now().Add(5 * time.Second)
+	deadlineRetry := time.Now().Add(12 * time.Second) // 全量 race 负载下角色释放可能被调度延迟
 	for {
 		fields2 = tryStat(3)
-		if fields[1] == KindErrorResponse && fields[4] == "wrong_stream_role" &&
+		if fields2[1] == KindErrorResponse && fields2[4] == "wrong_stream_role" &&
 			time.Now().Before(deadlineRetry) {
 			time.Sleep(50 * time.Millisecond)
 			continue
@@ -650,7 +651,7 @@ func TestStreamRebuildKeepsRequestIDMonotonic(t *testing.T) {
 	}
 	if fields2[1] == KindErrorResponse {
 		if fields2[4] != "stale_request_id" {
-			t.Fatalf("重建 stream 后 ID 倒退应报 stale_request_id，实际: %#v", fields)
+			t.Fatalf("重建 stream 后 ID 倒退应报 stale_request_id，实际: %#v", fields2)
 		}
 	} else if fields2[1] == KindStatResponse && fields2[2] != uint64(3) {
 		t.Fatalf("不应出现其他响应: %#v", fields2)
@@ -1182,4 +1183,134 @@ func TestMixedRoleReleasesSlotForRebuiltStream(t *testing.T) {
 // isWrongRole 判断响应是否为 wrong_stream_role（测试辅助）。
 func isWrongRole(f []any) bool {
 	return len(f) >= 5 && f[1] == KindErrorResponse && f[4] == "wrong_stream_role"
+}
+
+// ---------- 阻断 1：旧 handler 收尾不得二次释放新 stream 的角色 ----------
+
+type gateSource struct {
+	release   chan struct{}
+	completed atomic.Int32
+}
+
+func (g *gateSource) Stat(ctx context.Context, h string) (content.StatInfo, bool, error) {
+	<-g.release
+	return content.StatInfo{}, true, nil
+}
+func (g *gateSource) Resolve(ctx context.Context, h string) ([]byte, error) {
+	<-g.release
+	g.completed.Add(1)
+	return []byte{0x42}, nil
+}
+
+// TestOldStreamTeardownDoesNotStealNewRole（阻断 1 确定性测试）：
+//
+//  1. 旧 READ stream 发出请求后半关 → 服务端解析后提前释放角色并阻塞在 worker；
+//  2. 新 READ stream 取得角色并发请求（同样阻塞）；
+//  3. 放行 worker，等旧 handler 完整收尾（客户端读到 EOF 即 defer 已执行）；
+//  4. 第三条同角色 stream 必须仍被拒绝——
+//     若存在二次释放，此时新 stream 的角色会被错误清掉而放行第三条。
+func TestOldStreamTeardownDoesNotStealNewRole(t *testing.T) {
+	env := newTestEnv(t)
+	serverPriv := newKeyPair(t)
+	clientPriv := newKeyPair(t)
+	clientKeyHex, err := identityPubHex(clientPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := auth.NewPolicy("private", []string{clientKeyHex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := &gateSource{release: make(chan struct{})}
+	limits := DefaultLimits()
+	limits.MaxConcurrentReads = 8
+	limits.GlobalWriteBytesPerSec = 0
+	limits.ConnWriteBytesPerSec = 0
+	server := buildTestHost(t, serverPriv, false)
+	client := buildTestHost(t, clientPriv, false)
+	NewServerWithLimits(server, source, policy, metrics.New("test"), limits)
+	mustConnect(t, client, server)
+
+	hash := seedHash32(t, env.result)
+	h2, h3 := hash, hash
+	h2[0] ^= 0x11
+	h3[0] ^= 0x22
+
+	// 1) 旧 stream：请求 + 立即半关；稍候让服务端完成解析与提前释放。
+	s1 := openStream(t, client, server.ID())
+	sendRequest(t, s1, readRequest(1, hash, 0))
+	_ = s1.CloseWrite()
+	time.Sleep(80 * time.Millisecond)
+
+	// 2) 轮询第二条 stream 直到被接受：
+	//    读超时（无立即错误）⇒ 请求已被接受、worker 阻塞中；
+	//    wrong_stream_role ⇒ 角色尚未释放，重试；
+	//    其他错误 ⇒ 探针异常，快速失败。
+	var s2 network.Stream
+	acceptDeadline := time.Now().Add(5 * time.Second)
+	for {
+		st := openStream(t, client, server.ID())
+		sendRequest(t, st, readRequest(2, h2, 0))
+		_ = st.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		f, rerr := DecodeResponseFields(st)
+		if rerr != nil {
+			var ne net.Error
+			if errors.As(rerr, &ne) && ne.Timeout() {
+				_ = st.SetReadDeadline(time.Time{})
+				s2 = st
+				break
+			}
+			_ = st.Close()
+			t.Fatalf("探针 stream 异常关闭: %v", rerr)
+		}
+		_ = st.Close()
+		if len(f) >= 5 && f[4] == "wrong_stream_role" && time.Now().Before(acceptDeadline) {
+			time.Sleep(30 * time.Millisecond)
+			continue
+		}
+		t.Fatalf("第二条 stream 应被接受或仅因角色未释放被拒，实际: %#v", f)
+	}
+	defer s2.Close()
+
+	// 3) 放行 worker；旧 stream 的响应随后到达，读到 EOF 说明 handler 已完整返回。
+	close(source.release)
+	buf1 := bufio.NewReader(s1)
+	fields := readFields(t, buf1)
+	if fields[1] != KindReadResponse || fields[2] != uint64(1) {
+		t.Fatalf("旧 stream 应收到自己的成功响应: %#v", fields)
+	}
+	readAttachment(t, buf1, fields[4].(uint64))
+	_ = s1.SetReadDeadline(time.Now().Add(3 * time.Second))
+	eofBuf := make([]byte, 16)
+	if _, err := s1.Read(eofBuf); err == nil {
+		t.Fatal("旧 stream 应在 handler 返回后关闭")
+	}
+	// 再给调度一点余量，确保 defer 已执行完毕。
+	time.Sleep(100 * time.Millisecond)
+
+	// 4) 第三条同角色 stream：必须仍返回 wrong_stream_role。
+	s3 := openStream(t, client, server.ID())
+	defer s3.Close()
+	sendRequest(t, s3, readRequest(3, h3, 0))
+	_ = s3.SetReadDeadline(time.Now().Add(2 * time.Second))
+	f3, err := DecodeResponseFields(s3)
+	if err != nil {
+		t.Fatalf("读取第三条 stream 响应失败: %v", err)
+	}
+	if !isWrongRole(f3) {
+		t.Fatalf("二次释放竞态：第三条同角色 stream 应被拒绝，实际: %#v", f3)
+	}
+
+	// 第二条 stream 的成功响应最终可达（角色确实由它持有并完成服务）。
+	_ = s2.SetReadDeadline(time.Now().Add(3 * time.Second))
+	f2b, err := DecodeResponseFields(s2)
+	if err != nil {
+		t.Fatalf("读取第二条 stream 响应失败: %v", err)
+	}
+	if f2b[1] != KindReadResponse || f2b[2] != uint64(2) {
+		t.Fatalf("第二条 stream 应正常服务: %#v", f2b)
+	}
+	if got := source.completed.Load(); got != 2 {
+		t.Fatalf("两个阻塞 worker 都应完成，实际 %d", got)
+	}
 }

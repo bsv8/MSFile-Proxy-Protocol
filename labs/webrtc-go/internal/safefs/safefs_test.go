@@ -4,6 +4,7 @@ package safefs
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -212,5 +213,80 @@ func TestInodeChangeReopensAndDoesNotKeepClosedHandle(t *testing.T) {
 	_ = f.Close()
 	if _, _, err := r.OpenFile("f"); err == nil {
 		t.Fatal("旧文件不应在重开后的根里可见")
+	}
+}
+
+// ---------- 阻断 2：挂载反复波动不得泄漏目录 FD ----------
+
+// countFDs 统计当前进程打开的文件描述符数量（Linux /proc）。
+func countFDs(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Skipf("非 Linux 或无法读取 /proc/self/fd: %v", err)
+	}
+	return len(entries)
+}
+
+// TestMountFlapDoesNotLeakDirectoryFDs：
+// Root 已建立 → 根目录反复消失/恢复 → 旧 Root 必须在消失时被关闭，
+// FD 数量不得随波动次数线性增长；恢复后新 Root 功能正常。
+func TestMountFlapDoesNotLeakDirectoryFDs(t *testing.T) {
+	dir := t.TempDir()
+	r, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if err := os.WriteFile(filepath.Join(dir, "probe"), []byte("v"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	// 触发建立底层句柄。
+	if f, _, err := r.OpenFile("probe"); err != nil {
+		t.Fatal(err)
+	} else {
+		_ = f.Close()
+	}
+
+	before := countFDs(t)
+	const cycles = 60
+	for i := 0; i < cycles; i++ {
+		// 根目录消失：下一次访问触发 ensure → 关闭旧句柄。
+		if err := os.RemoveAll(dir); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.LstatFile("probe"); err == nil {
+			t.Fatal("目录消失后 Lstat 应失败")
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("消失期错误类型应为 NotExist，实际: %v", err)
+		}
+		// 目录恢复：同一 Root 自动重开并可读。
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "probe"), []byte("v"), 0o640); err != nil {
+			t.Fatal(err)
+		}
+		f, _, err := r.OpenFile("probe")
+		if err != nil {
+			t.Fatalf("第 %d 次恢复后读取失败: %v", i, err)
+		}
+		_ = f.Close()
+	}
+	after := countFDs(t)
+	growth := after - before
+	// 允许少量噪声；若每次泄漏一个目录 FD，增长应 ≈ cycles。
+	if growth > 10 {
+		t.Fatalf("检测到 FD 泄漏：%d 次波动增长 %d 个描述符", cycles, growth)
+	}
+
+	// 最终功能确认。
+	f, info, err := r.OpenFile("probe")
+	if err != nil {
+		t.Fatalf("收尾读取失败: %v", err)
+	}
+	defer f.Close()
+	if info.Size() != 1 {
+		t.Fatalf("内容尺寸异常: %d", info.Size())
 	}
 }

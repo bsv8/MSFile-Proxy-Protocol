@@ -337,9 +337,10 @@ func (s *Server) handleStream(stream network.Stream) {
 		_ = stream.SetReadDeadline(time.Now().Add(s.limits.RequestReadTimeout))
 		request, readErr := ReadRequest(reader)
 		if readErr != nil {
-			// 读循环退出：立即释放角色槽位，让客户端可以马上重建同角色 stream；
-			// 在途任务随后有界收尾，全部完成后由 defer cancel 统一释放资源。
-			cs.releaseRole(first.Kind)
+			// 读循环退出：立即释放角色槽位，让客户端可以马上重建同角色 stream。
+			// 必须经 Once 释放：直接调用会与上方 defer 构成二次释放——
+			// 旧 handler 收尾时会把新 stream 刚取得的角色错误清掉（阻断 1）。
+			releaseRoleOnce()
 			break
 		}
 		keepReading = handle(request)
