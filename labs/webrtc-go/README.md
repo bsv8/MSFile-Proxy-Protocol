@@ -44,6 +44,13 @@ msfile-webrtc-lab relay     Circuit Relay v2 信令基础设施（只承载 rese
 
 版本均锁定在 `go.mod`；交付不允许使用未锁定的分支或本地 replace。
 
+## 进程级冒烟与人工验收
+
+`internal/nas/process_e2e_test.go`（TestProcessLevelSmokeOnLocalDirectory）
+用真实二进制 + YAML 在本地目录跑通“启动→首次扫描→WS 读取逐块校验→SIGTERM→nas_data 零写入”。
+目标 NAS 挂载类型的人工验证按
+[docs/施工单/20260825-3-NAS挂载人工验收清单.md](../../docs/施工单/20260825-3-NAS挂载人工验收清单.md) 执行并留存证据。
+
 ## 开发与验收
 
 ```bash
@@ -67,6 +74,6 @@ go build ./cmd/msfile-webrtc-lab
 | T19–T21、T22、T23 | ✅ | internal/msfile（CBOR 严格性 / 双 stream / WS、WSS、WebRTC Direct E2E） |
 | T24 | ✅ | internal/admin |
 | T25–T26 | ✅ | internal/nas（第二实例锁、旧 schema fail closed、端口冲突回滚） |
-| T27 | ✅ 自动化部分：在途请求双层硬上限、全局/单连接带宽令牌桶、多连接并发冲击断言峰值不超限；真实 NAS 磁盘吞吐压测归入部署人工验证 |
+| T27 | ✅ 自动化部分：在途请求双层硬上限、全局/单连接带宽令牌桶（三场景）、多连接并发冲击断言峰值不超限；真实磁盘吞吐压测归入部署人工验证 |
 
 目标 NAS 挂载的人工验证仍按施工单 §10 在真实部署环境执行。
