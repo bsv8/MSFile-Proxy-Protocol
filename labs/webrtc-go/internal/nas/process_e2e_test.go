@@ -395,6 +395,69 @@ admin_listen: "127.0.0.1:%d"
 		t.Fatal("验收客户端写出的 Seed 与预期不一致")
 	}
 
+	// keygen 行为冒烟：排他创建 + 0600 + 二次拒绝。
+	keygenPath := filepath.Join(dir, "gen.key")
+	_ = runAcc("keygen", "--identity-key", keygenPath)
+	if info, err := os.Stat(keygenPath); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("keygen 权限应为 0600，实际 %v / err=%v", info, err)
+	}
+	accFail := exec.Command(accPath, "keygen", "--identity-key", keygenPath)
+	if out, err := accFail.CombinedOutput(); err == nil {
+		t.Fatalf("keygen 二次执行应失败:\n%s", out)
+	} else if !strings.Contains(string(out), "拒绝覆盖") {
+		t.Fatalf("二次 keygen 错误信息缺少拒绝覆盖提示:\n%s", out)
+	}
+
+	// verify-file：跨块文件逐块校验并重构原文件（阻断 3）。
+	rebuild := filepath.Join(dir, "reconstructed.mkv")
+	verifyJSON := runAcc("--addr", addrLine, "--identity-key", toolKeyPath,
+		"verify-file", "--seed-hash", movieHashHex, "--output", rebuild)
+	var vf struct {
+		SeedOK        bool     `json:"seed_ok"`
+		BlockTotal    int      `json:"block_total"`
+		BlockOK       int      `json:"block_ok"`
+		FailedHashes  []string `json:"failed_hashes"`
+		OutputFile    string   `json:"output_file"`
+		BytesVerified int64    `json:"bytes_verified"`
+	}
+	jsonPart := verifyJSON[strings.Index(verifyJSON, "{"):] // 剥离 stderr 中文字段说明行
+	if err := json.Unmarshal([]byte(jsonPart), &vf); err != nil {
+		t.Fatalf("verify-file 输出解析失败: %v\n%s", err, verifyJSON)
+	}
+	if !vf.SeedOK || vf.BlockTotal != 3 || vf.BlockOK != 3 || len(vf.FailedHashes) != 0 {
+		t.Fatalf("verify-file 结果不符: %+v", vf)
+	}
+	rebuilt, err := os.ReadFile(rebuild)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(rebuilt, movie) {
+		t.Fatal("verify-file 重构的原文件与 nas_data 原始字节不一致")
+	}
+
+	// load 冒烟：单连接长驻 READ stream 循环读取真实块，
+	// 断言无 wrong_stream_role、attempted==ok（正常负载）。
+	loadJSON := runAcc("--addr", addrLine, "--identity-key", toolKeyPath,
+		"load", "--seed-hash", movieHashHex,
+		"--connections", "1", "--requests-per-block", "2", "--duration", "20s")
+	var lr struct {
+		PlannedRequests   int            `json:"planned_requests"`
+		AttemptedRequests int            `json:"attempted_requests"`
+		OK                int            `json:"ok"`
+		ErrorCodes        map[string]int `json:"error_codes"`
+		ThroughputMBps    float64        `json:"throughput_mbps"`
+	}
+	loadPart := loadJSON[strings.Index(loadJSON, "{"):]
+	if err := json.Unmarshal([]byte(loadPart), &lr); err != nil {
+		t.Fatalf("load 输出解析失败: %v\n%s", err, loadJSON)
+	}
+	if lr.ErrorCodes["wrong_stream_role"] != 0 {
+		t.Fatalf("正常负载不得出现 wrong_stream_role：%+v", lr.ErrorCodes)
+	}
+	if lr.OK != lr.AttemptedRequests || lr.AttemptedRequests <= 0 {
+		t.Fatalf("正常负载下 ok 应等于 attempted：%+v", lr)
+	}
+
 	// SIGTERM：有界优雅停止且退出码为 0。
 	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
