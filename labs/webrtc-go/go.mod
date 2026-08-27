@@ -4,6 +4,7 @@ go 1.25.7
 
 require (
 	github.com/benbjohnson/clock v1.3.5
+	github.com/bsv8/bitcoin-libp2p v0.1.0
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/fxamacker/cbor/v2 v2.9.3
 	github.com/libp2p/go-libp2p v0.49.0

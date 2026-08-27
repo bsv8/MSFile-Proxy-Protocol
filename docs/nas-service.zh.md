@@ -79,12 +79,19 @@ V1 硬切换不支持自动迁移；请备份后改用空的 seed_data 目录重
 
 ## 4. 访问控制
 
+- `github.com/bsv8/bitcoin-libp2p@v0.1.0` 是 libp2p 身份与连接认证上游真值：
+  统一校验 secp256k1 私钥范围、压缩公钥、PeerId 推导和连接公钥绑定；
 - `access_mode: private`：仅允许配置文件 `public_key_whitelist` 中的压缩公钥；
   列表为空等价拒绝全部，不存在 allow-all 回退；
 - `access_mode: public`：任何 libp2p Noise 已认证的 secp256k1 客户端可用；
   服务端实施全局并发 Read 上限（默认 16），换公钥无法绕过；
 - 授权判断只使用 connection 层认证出的远端公钥，报文自报身份不参与；
 - WSS 的 TLS 不替代 Noise 与 PeerId 校验。
+
+MSFile 不复制上游身份协议，也不增加私有握手字段。`/msfile/1.0.0` 只运行在
+标准 Noise/Yamux 已认证连接之上。WebRTC Direct、WS/WSS transport 仍由 NAS 显式装配；
+这是因为上游 V1 的不可提取身份 host 不承诺需要 `PrivKey.Raw()` 的 WebRTC 构造路径，
+不代表 MSFile 可以自行定义另一套公钥或 PeerId 规则。
 
 ## 5. Web 运维台
 

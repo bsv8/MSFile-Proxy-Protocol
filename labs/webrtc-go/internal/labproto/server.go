@@ -94,7 +94,7 @@ func (s *Server) facts(conn network.Conn) (connFacts, error) {
 		limited:      conn.Stat().Limited,
 		transport:    TransportKind(conn.RemoteMultiaddr()),
 	}
-	hexKey, err := identity.RemoteCompressedPubKeyHex(conn.RemotePublicKey())
+	hexKey, err := identity.AuthenticatedRemoteCompressedPubKeyHex(conn)
 	if err != nil {
 		return f, err
 	}

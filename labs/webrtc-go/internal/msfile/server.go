@@ -208,7 +208,7 @@ func (s *Server) handleStream(stream network.Stream) {
 		_ = stream.Reset()
 		return
 	}
-	remoteKey, err := identity.RemoteCompressedPubKeyHex(conn.RemotePublicKey())
+	remoteKey, err := identity.AuthenticatedRemoteCompressedPubKeyHex(conn)
 	if err != nil {
 		s.log.Emit("msfile_stream_denied", map[string]any{"reason_zh": "远端身份不是 secp256k1 公钥"})
 		_ = stream.Reset()

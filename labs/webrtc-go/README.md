@@ -36,6 +36,7 @@ msfile-webrtc-lab relay     Circuit Relay v2 信令基础设施（只承载 rese
 | 依赖 | 版本 |
 |---|---|
 | Go | 1.25.x（go.mod 要求 >= 1.25） |
+| bitcoin-libp2p | v0.1.0（secp256k1 身份、PeerId 与连接认证上游真值） |
 | go-libp2p | v0.49.0 |
 | modernc.org/sqlite | v1.57.0（纯 Go 驱动） |
 | fsnotify | v1.9.0 |
@@ -43,6 +44,19 @@ msfile-webrtc-lab relay     Circuit Relay v2 信令基础设施（只承载 rese
 | benbjohnson/clock | v1.3.5（测试注入时钟） |
 
 版本均锁定在 `go.mod`；交付不允许使用未锁定的分支或本地 replace。
+
+### libp2p 上游边界
+
+本模块直接依赖 `github.com/bsv8/bitcoin-libp2p@v0.1.0`：私钥标量范围、
+压缩公钥、PeerId 推导，以及 Noise 安全升级后“远端公钥 ↔ PeerId”的一致性验证
+均以上游为真值。MSFile 只定义 `/msfile/1.0.0` 业务 stream、文件存储和访问策略，
+不得复制或另写一套身份推导规则。
+
+正式 NAS 仍由原生 go-libp2p host 显式装配 WebRTC Direct、WS/WSS 和 ResourceManager。
+原因是 bitcoin-libp2p V1 的不可提取身份 host 明确不承诺 WebRTC 构造器所需的
+`PrivKey.Raw()`；这里保留可提取本地 transport key 只是 transport 兼容边界，
+其合法性、公共身份和连接认证仍统一调用 bitcoin-libp2p。上游 `NewHost` 与本服务的
+真实 WS 互联由 `TestBitcoinLibp2pUpstreamClientInteroperatesOverWS` 持续验证。
 
 ## 验收客户端
 

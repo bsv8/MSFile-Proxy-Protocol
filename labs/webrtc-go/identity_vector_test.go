@@ -67,6 +67,8 @@ func TestPrivateKeyFormatAndRangeGuards(t *testing.T) {
 		{"too short", "abcd", true},
 		{"not hex", strings.Repeat("zz", 32), true},
 		{"zero scalar", strings.Repeat("00", 32), true},
+		// secp256k1 曲线阶 n 本身不属于合法私钥范围 1..n-1。
+		{"curve order scalar", "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -87,20 +89,30 @@ func TestCompressedPublicKeyCanonicalBytesFromConnectionKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("vector key: %v", err)
 	}
-	hexKey, err := identity.RemoteCompressedPubKeyHex(priv.GetPublic())
+	raw, err := priv.GetPublic().Raw()
 	if err != nil {
+		t.Fatalf("读取 secp256k1 公钥失败: %v", err)
+	}
+	if err := identity.ValidateCompressedSecp256k1(raw); err != nil {
 		t.Fatalf("secp256k1 public key rejected: %v", err)
 	}
-	raw, _ := hex.DecodeString(hexKey)
+	hexKey := hex.EncodeToString(raw)
 	if len(raw) != 33 || (raw[0] != 0x02 && raw[0] != 0x03) {
 		t.Fatalf("expected canonical 33-byte compressed point, got %d bytes", len(raw))
+	}
+	if hexKey != v.PublicKeyHex {
+		t.Fatalf("规范公钥不匹配：得到 %s，期望 %s", hexKey, v.PublicKeyHex)
 	}
 
 	_, ed25519Pub, err := crypto.GenerateEd25519Key(rand.Reader)
 	if err != nil {
 		t.Fatalf("generate ed25519 key: %v", err)
 	}
-	if _, err := identity.RemoteCompressedPubKeyHex(ed25519Pub); err == nil {
+	ed25519Raw, err := ed25519Pub.Raw()
+	if err != nil {
+		t.Fatalf("读取 ed25519 公钥失败: %v", err)
+	}
+	if err := identity.ValidateCompressedSecp256k1(ed25519Raw); err == nil {
 		t.Fatal("expected non-secp256k1 public key to be rejected")
 	}
 }
