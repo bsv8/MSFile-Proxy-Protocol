@@ -146,3 +146,4 @@ vite.config.ts.timestamp-*
 labs/webrtc-go/msfile-webrtc-lab
 labs/webrtc-go/*.key
 *.test.key
+AGENTS.md
