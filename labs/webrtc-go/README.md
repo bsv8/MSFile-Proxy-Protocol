@@ -10,12 +10,15 @@ msfile-nas --config /etc/msfile-nas.yaml
 ```
 
 - 数据模型：`nas_data`（用户原文件，只读真值）+ `seed_data`（Seed/SQLite/staging/trash，可重建）；
-- 协议：仅注册 `/msfile/1.0.0`；WebRTC Direct + WS/WSS 承载；
+- 协议：仅注册 `/msfile/1.0.0`；WebRTC Direct + WS/WSS 承载；普通 Web 与 WS/WSS 共用
+  `listen` 中的同一 TCP 入口，非 Upgrade 请求交给 Web Handler；
 - 授权：`access_mode: private` 配置文件公钥白名单 / `public` 任意已认证 secp256k1；
   空白名单拒绝全部，没有 allow-all 回退；
 - 同步：fsnotify 文件事件快速发现 + 周期全量扫描最终收敛 + stat A/B/C 稳定性检测；
 - 存储：SQLite 单执行器串行队列；Seed staging+fsync+原子 rename 发布；
-- Web：中文平面 Hash 公共内容索引，只展示当前有效文件，支持搜索、详情和按文件名下载；无目录树、无上传删除、无白名单管理。
+- Web：中文平面 Hash 公共内容索引，只展示当前有效文件，支持搜索、详情和按文件名下载；
+  页面“网络接入地址”按当前浏览器 URL 生成 WSS multiaddr，并展示配置地址补齐后的 WebRTC Direct
+  multiaddr；无目录树、无上传删除、无白名单管理。
 
 配置示例见 [config/msfile-nas.example.yaml](config/msfile-nas.example.yaml)（全字段中文注释）。
 
@@ -80,6 +83,7 @@ cd labs/webrtc-go
 go test ./...          # 自动化测试矩阵（见下）
 go test -race ./...    # 并发与竞争检查
 go vet ./...
+node --test internal/admin/web/network-address.test.mjs  # G12-G14 页面地址规则
 go build ./cmd/msfile-nas
 go build ./cmd/msfile-webrtc-lab
 ```

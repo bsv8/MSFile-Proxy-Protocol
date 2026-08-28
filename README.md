@@ -32,7 +32,10 @@ JSON、Base64 或十六进制包装。
   完整性失败 fail closed；
 - **授权**：`access_mode: private` 使用配置文件公钥白名单（空白名单拒绝全部），
   `public` 放行任意已认证 secp256k1 客户端并实施全局资源限额；
-- **传输**：libp2p WebRTC Direct + WS/WSS 承载正式 `/msfile/1.0.0`；
+- **传输**：libp2p WebRTC Direct + WS/WSS 承载正式 `/msfile/1.0.0`；普通 Web 与 WS/WSS 共用同一
+  TCP 入口，公网 WSS multiaddr 由 NAS Web 页面使用当前浏览器 URL 生成；
+- **公网地址**：`webrtc_direct_public_addresses` 只配置公网 UDP 基础地址，服务运行时补齐
+  `certhash` 与 PeerId；不配置 WSS 公网地址字段；
 - **存储**：SQLite 由单个异步执行器独占（MaxOpenConns=1），业务代码无法绕过；
 - **Web**：中文平面 Hash 公共内容索引，只展示当前有效文件并支持按文件名/Hash 搜索、详情查看与按文件名下载；不提供原文件写操作。
 

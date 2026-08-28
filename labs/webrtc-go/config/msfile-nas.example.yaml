@@ -59,28 +59,48 @@ enable_file_watcher: true
 
 # ───────────────────────── 网络监听 ─────────────────────────
 
-# libp2p 监听 multiaddr 列表，支持：
-#   /ip4/0.0.0.0/udp/4001/webrtc-direct   WebRTC Direct（浏览器可直连）
-#   /ip4/0.0.0.0/tcp/4002/ws              裸 WS（仅限 loopback 或可信内网）
-#   /ip4/0.0.0.0/tcp/4002/tls/ws          WSS（生产公网浏览器必须使用）
+# WebRTC Direct 对外公布的公网 UDP 基础地址。
+# 这里只填写公网 IP/DNS、UDP 端口和 /webrtc-direct；禁止手工填写 /certhash 或 /p2p。
+# 服务启动后使用当前 host 的运行时 certhash 与 PeerId 自动补齐完整地址。
+# DNS 不会在启动时解析，也不会自动判断 Cloudflare 是否为橙云；请使用能直接到达 NAS
+# UDP 端口的公网 IP 或 DNS-only 名称。
+webrtc_direct_public_addresses:
+  - "/dns4/direct-nas.example.com/udp/4001/webrtc-direct"
+  # 也可以使用公网 IPv4/IPv6：
+  # - "/ip4/203.0.113.10/udp/4001/webrtc-direct"
+
+# libp2p 监听 multiaddr 列表：这是 NAS 进程在本机真正绑定的 transport 地址。
+# 普通 Web 与 libp2p WS/WSS 必须写在同一个 TCP listener 上，由 WebSocket transport
+# 根据是否 HTTP Upgrade 分流：非 Upgrade 交给 Web Handler，Upgrade 进入 libp2p。
+#
+# 形态 A（本例启用）：同机 Nginx/Caddy 在公网 443 终止 TLS，再透传到 NAS 的 loopback 4002。
+# 反向代理必须把 https://nas.example.com:443 转发到 http://127.0.0.1:4002。
+#   /ip4/0.0.0.0/udp/4001/webrtc-direct   WebRTC Direct 公网 UDP listener
+#   /ip4/127.0.0.1/tcp/4002/ws            反向代理后的源站 WS listener
+#
+# 形态 B（不要与形态 A 同时启用）：NAS 自己在 443 终止 Full (Strict) 源站 TLS。
+# 此时代理不能再占用同一网络命名空间的 443：
+#   /ip4/0.0.0.0/tcp/443/tls/ws            NAS 直接终止 TLS 的 WSS listener
 listen:
   - "/ip4/0.0.0.0/udp/4001/webrtc-direct"
-  - "/ip4/0.0.0.0/tcp/4002/ws"
+  - "/ip4/127.0.0.1/tcp/4002/ws"
 
-# 直接终止 TLS 的 WSS 证书与私钥 PEM；两者必须成对出现。
-# 注意：transport 是否启用 TLS 由 listen 里的 multiaddr 显式决定——
-# 配置证书后，listen 中不允许再出现裸 /ws（请显式写成 /tls/ws），否则启动失败。
+# 如果选择形态 B，请把上面的 TCP 行替换为下面三行，并同时配置证书与私钥：
+# transport 是否启用 TLS 由 listen 中的 multiaddr 显式决定，证书不会隐式升级裸 WS。
 # TLS 不替代 Noise 与 PeerId 校验。
+#listen:
+#  - "/ip4/0.0.0.0/udp/4001/webrtc-direct"
+#  - "/ip4/0.0.0.0/tcp/443/tls/ws"
 #tls_cert_file: "/etc/msfile-nas/tls.crt"
 #tls_key_file: "/etc/msfile-nas/tls.key"
 
 # ───────────────────────── Web 公共内容索引 ─────────────────────────
 
-# Web 公共内容索引监听地址。页面只展示当前有效文件，并提供详情与下载；
-# 默认只允许 loopback 访问，若监听非 loopback，建议前置可信 TLS。
-admin_listen: "127.0.0.1:8080"
+# 已弃用的旧版 host:port 字段：保留只是为了让旧 YAML 可加载，不创建 listener，
+# 也不参与端口或安全校验。实际绑定和 Web/API 入口只由 listen 决定；新配置可删除。
+#admin_listen: "127.0.0.1:4002"
 
-# 兼容运维 API（/api/status、/api/scans）的 Bearer Token。
-# 公共内容索引、详情和下载不需要此 token；token 不是 MSFile 客户端凭据。
-# 监听非 loopback 地址时必须配置此 token，以保护兼容运维 API。
-# admin_token: "请替换为足够长的随机字符串"
+# 兼容运维 API（/api/status、/api/scans）的 Bearer Token；共享入口为非 loopback 时必填。
+# 为空表示运维 API 禁用（始终返回 401）；公共内容索引、详情和下载不需要此 token。
+# token 不是 MSFile 客户端凭据。
+admin_token: "请替换为足够长的随机字符串"

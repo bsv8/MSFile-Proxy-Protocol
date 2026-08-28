@@ -42,8 +42,10 @@ type smokeCounts struct {
 }
 
 type smokeStatus struct {
-	Counts      smokeCounts `json:"counts"`
-	ScanRunning bool        `json:"scan_running"`
+	Counts          smokeCounts `json:"counts"`
+	ScanRunning     bool        `json:"scan_running"`
+	PeerID          string      `json:"peer_id"`
+	ListenAddresses []string    `json:"listen_addresses"`
 }
 
 func freePort(t *testing.T) int {
@@ -177,7 +179,6 @@ func TestProcessLevelSmokeOnLocalDirectory(t *testing.T) {
 	}
 
 	wsPort := freePort(t)
-	adminPort := freePort(t)
 	cfgText := fmt.Sprintf(`# 进程级冒烟配置（自动生成）
 identity_key_file: %q
 
@@ -200,13 +201,14 @@ hash_workers: 1
 listen:
   - "/ip4/127.0.0.1/tcp/%d/ws"
 admin_listen: "127.0.0.1:%d"
+admin_token: "process-test-token"
 `,
 		serverKeyPath,
 		nasRoot,
 		filepath.Join(dir, "seed_data"),
 		hex.EncodeToString(pubRaw),
 		hex.EncodeToString(toolPubRaw),
-		wsPort, adminPort)
+		wsPort, wsPort)
 	cfgPath := filepath.Join(dir, "msfile-nas.yaml")
 	if err := os.WriteFile(cfgPath, []byte(cfgText), 0o600); err != nil {
 		t.Fatal(err)
@@ -230,16 +232,23 @@ admin_listen: "127.0.0.1:%d"
 	}
 	defer func() { _ = cmd.Process.Kill() }()
 
-	base := fmt.Sprintf("http://127.0.0.1:%d", adminPort)
+	base := fmt.Sprintf("http://127.0.0.1:%d", wsPort)
 	readyDeadline := time.Now().Add(45 * time.Second)
 	ready := false
+	var serviceStatus smokeStatus
 	for time.Now().Before(readyDeadline) {
-		resp, err := http.Get(base + "/api/status")
+		req, reqErr := http.NewRequest(http.MethodGet, base+"/api/status", nil)
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		req.Header.Set("Authorization", "Bearer process-test-token")
+		resp, err := http.DefaultClient.Do(req)
 		if err == nil {
 			var sr smokeStatus
 			derr := json.NewDecoder(resp.Body).Decode(&sr)
 			resp.Body.Close()
 			if derr == nil && !sr.ScanRunning && sr.Counts.ReadyContents == 3 {
+				serviceStatus = sr
 				ready = true
 				break
 			}
@@ -250,13 +259,15 @@ admin_listen: "127.0.0.1:%d"
 		t.Fatalf("首次扫描未在时限内完成三个内容索引；最近日志:\n%s", stdout.recent(2048))
 	}
 
-	// 从日志解析带 PeerId 的服务地址。
+	if strings.Contains(stdout.String(), "NAS MSFile multiaddr（可复制）") {
+		t.Fatal("启动日志不应输出可复制的 multiaddr")
+	}
+
+	// 从受保护的 status 读取本机真实 listener，再附加运行中 PeerId。
 	addrLine := ""
-	needle := fmt.Sprintf("tcp/%d/ws", wsPort)
-	for _, line := range strings.Split(stdout.String(), "\n") {
-		if strings.Contains(line, needle) && strings.Contains(line, "/p2p/") {
-			idx := strings.Index(line, "/ip4/")
-			addrLine = line[idx:]
+	for _, address := range serviceStatus.ListenAddresses {
+		if strings.HasSuffix(address, "/ws") {
+			addrLine = address + "/p2p/" + serviceStatus.PeerID
 			break
 		}
 	}

@@ -15,7 +15,7 @@ msfile-nas --config /etc/msfile-nas.yaml --check-config  # 仅校验配置
 服务提供三类接口：
 
 1. `/msfile/1.0.0`：运行在已认证 libp2p stream 上的 MSFile Proxy V1（Stat/Read）；
-2. WebRTC Direct、WS、WSS：libp2p transport；
+2. WebRTC Direct、WS、WSS：libp2p transport；WS/WSS 与普通 Web 共用同一个 TCP 入口；
 3. Web 公共内容索引：平面 Hash 索引、文件详情与按文件名下载。
 
 ### 两个数据区
@@ -93,22 +93,120 @@ MSFile 不复制上游身份协议，也不增加私有握手字段。`/msfile/1
 这是因为上游 V1 的不可提取身份 host 不承诺需要 `PrivKey.Raw()` 的 WebRTC 构造路径，
 不代表 MSFile 可以自行定义另一套公钥或 PeerId 规则。
 
-## 5. Web 公共内容索引
+## 5. 网络入口与 Web 公共内容索引
 
-默认监听 loopback。公共页面只使用以下接口，接口不要求 Bearer Token：
+### 5.1 同端口 Web/WS 分流
+
+`listen` 是 NAS 进程在本机真正绑定的 transport 地址，至少要有一条 `/ws` 或 `/tls/ws`
+入口。普通 Web 与 libp2p WebSocket transport 使用同一个 TCP listener：
 
 ```text
-GET  /api/files                              当前有效内容列表（支持前缀 Hash/文件名搜索）
-GET  /api/files/{seed_hash}                  文件详情与下载地址
-GET  /api/files/{seed_hash}/download         按索引 filename 下载原文件
+HTTP request（没有 Upgrade）       -> Web Handler（页面与 HTTP API）
+HTTP/1.1 WebSocket Upgrade        -> libp2p WebSocket transport
+                                      -> Noise -> Yamux -> /msfile/1.0.0
 ```
+
+施工后不会再由 `admin_listen` 创建第二个 `net.Listen`。`admin_listen` 仍作为旧配置兼容字段
+接受，但实际绑定、端口和安全校验都以 `listen` 为准；新配置可删除该字段。若旧配置仍保留，
+启动时会输出一次中文弃用提示。
+长下载只受 HTTP header 读取和空闲连接限制，不会被 WebSocket handshake timeout 截断。
+
+推荐反向代理终止 TLS 的配置形态：
+
+```yaml
+# WebRTC Direct 公网 UDP 基础地址：只写 IP/DNS、UDP 端口和 /webrtc-direct。
+# certhash 与 /p2p/<PeerId> 由运行中的 host 自动补齐。
+webrtc_direct_public_addresses:
+  - "/dns4/direct-nas.example.com/udp/4001/webrtc-direct"
+
+# 本机实际 listener；普通 Web 和 WS 共用下面的 TCP 入口。
+listen:
+  - "/ip4/0.0.0.0/udp/4001/webrtc-direct"
+  - "/ip4/127.0.0.1/tcp/4002/ws"
+
+# 非 loopback 共享入口必须配置，保护 /api/status 与 /api/scans。
+admin_token: "替换为随机长 token"
+```
+
+上例对应“同机反向代理终止 TLS”：Nginx/Caddy 监听公网 443，并把 HTTPS/Upgrade 透明转发到
+`127.0.0.1:4002`。代理已经占用 443 时，NAS 不得再次绑定 `0.0.0.0:443/ws`。
+
+如果 NAS 直接终止源站 TLS，使用下面的独立形态（不要与上例的 4002 源站同时配置）：
+
+```yaml
+listen:
+  - "/ip4/0.0.0.0/udp/4001/webrtc-direct"
+  - "/ip4/0.0.0.0/tcp/443/tls/ws"
+tls_cert_file: "/etc/msfile-nas/tls.crt"
+tls_key_file: "/etc/msfile-nas/tls.key"
+admin_token: "替换为随机长 token"
+```
+
+Cloudflare 使用 Full (Strict) 时，源站证书必须合法、未过期且覆盖访问域名；`/tls/ws` 与
+证书/私钥的错配会在 `--check-config` 阶段拒绝。
+反向代理必须透明透传 WebSocket Upgrade 和二进制字节，不得缓存或解析 MSFile Frame。
+
+### 5.2 WebRTC Direct 公网地址
+
+`webrtc_direct_public_addresses` 是客户端从公网拨号的地址，不是本机 listener 的替代品。
+每项只允许以下形态：
+
+```text
+/ip4/<公网 IP>/udp/<端口>/webrtc-direct
+/ip6/<公网 IP>/udp/<端口>/webrtc-direct
+/dns4/<域名>/udp/<端口>/webrtc-direct
+/dns6/<域名>/udp/<端口>/webrtc-direct
+```
+
+地址必须使用 `1..65535` 的 UDP 端口；禁止 `/certhash`、`/p2p`、`/ws`、`/tls` 和其他协议
+段；IP 不能是 unspecified、loopback、multicast、link-local 或明确的私网地址；重复项按
+首次出现顺序去重。监听 WebRTC Direct 却不配置公网基础地址，或未监听却配置该字段，都会在
+创建 listener 前失败。DNS 不在启动时解析，也不由服务判断 Cloudflare 橙云状态。
+
+服务从运行中 WebRTC Direct listener 取得 `certhash`，再加上当前 host 的 PeerId，形成页面中
+可复制的完整地址。服务不会从本机地址、STUN、UPnP、NAT-PMP 或 Cloudflare Header 推测公网地址。
+
+### 5.3 公共页面与 API
+
+公共页面不需要 Bearer Token，展示“网络接入地址”与内容索引。`GET /api/network-info` 是
+拨号方需要的最小公开接口，响应字段如下：
+
+| 字段 | 中文含义 |
+|---|---|
+| `peer_id` | NAS 业务私钥派生的 libp2p PeerId |
+| `supplier_public_key` | NAS 的 33 字节压缩 secp256k1 公钥 hex |
+| `webrtc_direct_addresses` | 已补齐 `certhash` 和 PeerId 的公网 WebRTC Direct multiaddr |
+
+该接口只允许 `GET`、不要求 token，响应使用 JSON、安全响应 Header 和 `Cache-Control: no-store`。
+listener 已开始接收请求但运行时 `certhash`/PeerId 地址快照尚未完成时，返回 `503` 和中文错误码
+`network_info_not_ready`；页面会短暂退避后重试，不把空地址列表当作“已就绪”。
+它不会返回 WSS multiaddr、本机 `listen_addresses`、私钥、白名单、admin token、数据路径或
+Cloudflare 凭据。WSS 地址由页面使用当前浏览器的 `window.location.hostname` 与有效端口生成：
+
+```text
+HTTPS 页面 -> /ip4|ip6|dns4/<当前域名>/tcp/<端口>/tls/ws/p2p/<peer_id>
+loopback HTTP 开发页 -> /ip4|ip6|dns4/<当前主机>/tcp/<端口>/ws/p2p/<peer_id>
+公网 HTTP 页面 -> 显示“公网浏览器必须使用 HTTPS/WSS”，不生成生产 WSS 地址
+```
+
+页面不会修改或保存地址，也不把“显示地址”当作“已从外网验证可达”。WSS 与 WebRTC Direct
+即使使用相同 hostname，也分别是 TCP/TLS 和公网 UDP 两条独立路径；普通 Cloudflare 橙云
+记录通常不能把 UDP 直接导向 NAS。
 
 列表只返回 `ready` 且至少有一个 `valid` 文件位置的内容；公共详情不暴露 NAS 内部路径。
 其余方法返回中文 `405`；不存在白名单 CRUD 或原文件写路由。
 
 为兼容已有脚本，`GET /api/status`、`GET /api/scans`、`POST /api/scans` 仍保留，
-但不出现在公共页面，且继续要求 `admin_token`（Bearer）。`access_mode=public`
-不会改变这些兼容运维接口的认证要求。
+但不出现在公共页面，且继续要求 `admin_token`（Bearer）。`admin_token` 为空时表示运维 API
+禁用，受保护接口始终返回 401；`access_mode=public`
+不会改变这些兼容运维接口的认证要求。`/api/status` 中：
+
+| 字段 | 中文含义 |
+|---|---|
+| `listen_addresses` | 本机实际绑定/运行的 transport 地址 |
+| `webrtc_direct_public_addresses` | YAML 配置的 WebRTC Direct 公网基础地址 |
+
+`/api/status` 不生成 WSS 公网地址。
 
 ## 6. 一次性切换与回滚
 
@@ -131,8 +229,15 @@ msfile-nas --config /etc/msfile-nas.yaml --check-config
 # 查看日志事件（JSON，中文 reason_zh）
 journalctl -u msfile-nas -f | jq 'select(.event|test("scan|gc|watcher"))'
 
-# 兼容运维接口：手动触发全量扫描（公共页面不提供此按钮）
-curl -s -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/scans
+# 共享 Web/WS 入口上的兼容运维接口：手动触发全量扫描（公共页面不提供此按钮）
+curl -s -X POST -H "Authorization: Bearer $TOKEN" https://nas.example.com/api/scans
+
+# 公开网络信息（不带 token；只返回 PeerId、公钥和已补齐的 WebRTC Direct 地址）
+curl -s https://nas.example.com/api/network-info | jq
+
+# 读取受保护状态（实际地址以 listen 中的共享入口为准）
+curl -s -H "Authorization: Bearer $TOKEN" https://nas.example.com/api/status | jq \
+  '{peer_id, listen_addresses, webrtc_direct_public_addresses, counts, scan_running}'
 
 # 从零重建索引（确认 nas_data 无需变更后）
 systemctl stop msfile-nas

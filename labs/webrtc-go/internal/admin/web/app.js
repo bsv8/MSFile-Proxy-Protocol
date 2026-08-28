@@ -1,5 +1,12 @@
 // MSFile 公共内容索引前端。
 // 公共页面只查询当前可用内容；详情页通过服务端提供的地址下载原文件。
+import {
+  currentBrowserNetworkAddress,
+  hasSameHostname,
+  normalizeHostname,
+  validateNetworkPayload
+} from "./network-address.mjs";
+
 "use strict";
 
 var uiState = {
@@ -18,7 +25,10 @@ function request(method, url) {
     return res.json().catch(function () { return {}; }).then(function (data) {
       if (!res.ok) {
         var message = data && data.error_message_zh ? data.error_message_zh : ("HTTP " + res.status);
-        throw new Error(message);
+        var error = new Error(message);
+        error.status = res.status;
+        error.code = data && data.error_code ? data.error_code : "";
+        throw error;
       }
       return data;
     });
@@ -33,6 +43,154 @@ function showError(message) {
   banner.setAttribute("role", "alert");
   banner.textContent = "请求失败：" + message;
   document.querySelector("main").prepend(banner);
+}
+
+function showNetworkError(message, keepContent) {
+  var banner = $("network-error");
+  banner.textContent = "网络接入地址错误：" + message;
+  banner.hidden = false;
+  $("network-state").textContent = "加载失败";
+  if (!keepContent) $("network-content").hidden = true;
+}
+
+function clearNetworkError() {
+  var banner = $("network-error");
+  banner.textContent = "";
+  banner.hidden = true;
+}
+
+function createCopyButton(targetID) {
+  var button = document.createElement("button");
+  button.type = "button";
+  button.className = "copy-button";
+  button.textContent = "复制";
+  button.setAttribute("data-copy-target", targetID);
+  bindCopyButton(button);
+  return button;
+}
+
+function copyText(value) {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(value);
+  }
+  var area = document.createElement("textarea");
+  area.value = value;
+  area.setAttribute("readonly", "");
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  area.select();
+  var copied = false;
+  try { copied = document.execCommand("copy"); } catch (_) { copied = false; }
+  area.remove();
+  return copied ? Promise.resolve() : Promise.reject(new Error("浏览器拒绝了剪贴板操作"));
+}
+
+function bindCopyButton(button) {
+  button.addEventListener("click", function () {
+    var target = $(button.getAttribute("data-copy-target"));
+    var value = target ? target.textContent.trim() : "";
+    if (!value) {
+      showNetworkError("没有可复制的地址", true);
+      return;
+    }
+    copyText(value).then(function () {
+      var original = button.textContent;
+      button.textContent = "已复制";
+      window.setTimeout(function () { button.textContent = original; }, 1600);
+    }).catch(function (error) {
+      showNetworkError(error.message || "复制失败", true);
+    });
+  });
+}
+
+function renderDirectAddress(item, index) {
+  var card = document.createElement("article");
+  card.className = "address-card generated-direct";
+
+  var topline = document.createElement("div");
+  topline.className = "address-card-topline";
+  var title = document.createElement("div");
+  var transport = document.createElement("p");
+  transport.className = "address-transport";
+  transport.textContent = "WebRTC Direct";
+  var heading = document.createElement("h3");
+  heading.textContent = "公网 UDP 直连 " + (index + 1);
+  title.appendChild(transport);
+  title.appendChild(heading);
+  var badge = document.createElement("span");
+  badge.className = "address-badge";
+  badge.textContent = "UDP";
+  topline.appendChild(title);
+  topline.appendChild(badge);
+  card.appendChild(topline);
+
+  var valueRow = document.createElement("div");
+  valueRow.className = "address-value-row";
+  var value = document.createElement("code");
+  value.className = "address-value";
+  value.id = "direct-address-" + index;
+  value.textContent = item.value;
+  valueRow.appendChild(value);
+  valueRow.appendChild(createCopyButton(value.id));
+  card.appendChild(valueRow);
+
+  var note = document.createElement("p");
+  note.className = "address-note";
+  note.textContent = "公网 UDP 直连，不经普通 Cloudflare HTTP 代理；hostname、端口、certhash 和 PeerId 均来自服务端运行时信息。";
+  card.appendChild(note);
+  return card;
+}
+
+function renderNetwork(data) {
+  var network = validateNetworkPayload(data);
+  clearNetworkError();
+  $("network-peer-id").textContent = network.peerID;
+  $("network-public-key").textContent = network.publicKey;
+
+  var list = $("direct-address-list");
+  list.querySelectorAll(".generated-direct").forEach(function (card) { card.remove(); });
+  $("direct-empty").hidden = network.direct.length !== 0;
+  network.direct.forEach(function (item, index) {
+    list.insertBefore(renderDirectAddress(item, index), $("direct-empty"));
+  });
+
+  var wssError = null;
+  var wss = $("wss-address");
+  var wssRow = $("wss-address-row");
+  try {
+    wss.textContent = currentBrowserNetworkAddress(window.location, network.peerID);
+    wssRow.hidden = false;
+    $("wss-note").textContent = "经 Cloudflare TCP/TLS；地址使用当前浏览器页面的域名和端口生成。";
+  } catch (error) {
+    wss.textContent = "";
+    wssRow.hidden = true;
+    $("wss-note").textContent = error.message;
+    wssError = error.message;
+  }
+
+  var sameHost = hasSameHostname(normalizeHostname(window.location.hostname), network.direct);
+  $("same-host-note").hidden = !sameHost;
+  $("network-content").hidden = false;
+  if (wssError) {
+    showNetworkError(wssError, true);
+  } else {
+    $("network-state").textContent = "已加载";
+  }
+}
+
+function loadNetworkInfo(attempt) {
+  var currentAttempt = attempt || 0;
+  request("GET", "/api/network-info").then(renderNetwork).catch(function (error) {
+    if (error.code === "network_info_not_ready" && currentAttempt < 5) {
+      // listener 已可接收请求但运行时 certhash 尚未发布时，短暂退避重试。
+      var delay = Math.min(2000, 200 * Math.pow(2, currentAttempt));
+      $("network-state").textContent = "网络信息准备中…";
+      window.setTimeout(function () { loadNetworkInfo(currentAttempt + 1); }, delay);
+      return;
+    }
+    showNetworkError(error.message || "无法读取网络信息", false);
+  });
 }
 
 function fmtBytes(value) {
@@ -187,4 +345,6 @@ $("btn-close-detail").addEventListener("click", function () {
   $("detail-panel").hidden = true;
 });
 
+document.querySelectorAll(".copy-button").forEach(bindCopyButton);
+loadNetworkInfo();
 loadFiles();

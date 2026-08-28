@@ -34,7 +34,7 @@ func main() {
 		os.Exit(2)
 	}
 	if *checkOnly {
-		fmt.Println("配置校验通过：nas_data、seed_data、access_mode 与公钥列表均合法")
+		fmt.Println("配置校验通过：数据目录、访问策略、listener、WebRTC Direct 公网地址与 TLS 配置均合法")
 		return
 	}
 	app, err := nas.New(cfg)

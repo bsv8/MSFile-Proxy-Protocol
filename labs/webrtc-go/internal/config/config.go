@@ -4,6 +4,7 @@
 package config
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/benbjohnson/clock"
+	ma "github.com/multiformats/go-multiaddr"
 	"gopkg.in/yaml.v3"
 
 	"msfile.dev/labs/webrtc-go/internal/identity"
@@ -65,9 +67,10 @@ type Config struct {
 	InvalidRetention   Duration `yaml:"invalid_retention"`    // 文件不可见后的派生数据保留时间，默认 24h
 	HashWorkers        int      `yaml:"hash_workers"`         // 同时读取原文件并计算 Seed 的 worker 数，默认 1
 
-	ListenAddrs []string `yaml:"listen"`       // libp2p 监听 multiaddr 列表（webrtc-direct、ws、tls/ws）
-	AdminListen string   `yaml:"admin_listen"` // Web 公共内容服务监听地址，默认只监听 loopback
-	AdminToken  string   `yaml:"admin_token"`  // 兼容运维 API 的 Bearer Token；非 loopback 监听时必填
+	ListenAddrs                 []string `yaml:"listen"`                         // NAS 进程在本机真正绑定的 transport 地址（WebRTC Direct、WS、WSS）
+	WebRTCDirectPublicAddresses []string `yaml:"webrtc_direct_public_addresses"` // 对外公布的 WebRTC Direct 公网 UDP 基础地址；运行时补齐 certhash/PeerId
+	AdminListen                 string   `yaml:"admin_listen"`                   // 已弃用的旧兼容字段；不参与监听、端口或安全校验
+	AdminToken                  string   `yaml:"admin_token"`                    // 兼容运维 API 的 Bearer Token；共享入口为非 loopback 时必填；为空时运维 API 禁用
 
 	EnableFileWatcher *bool `yaml:"enable_file_watcher"` // 是否启用文件事件监视器；默认开启。关闭后仅靠周期全量扫描收敛（诊断与测试用途）
 
@@ -116,10 +119,9 @@ func (c *Config) applyDefaults() {
 		c.HashWorkers = MinHashWorkers
 	}
 	if len(c.ListenAddrs) == 0 {
-		c.ListenAddrs = []string{"/ip4/0.0.0.0/udp/4001/webrtc-direct", "/ip4/0.0.0.0/tcp/4002/ws"}
-	}
-	if c.AdminListen == "" {
-		c.AdminListen = "127.0.0.1:8080"
+		// 默认只开启 loopback Web 入口。WebRTC Direct 的公网 UDP 地址必须由
+		// 运维在 YAML 中显式配置，不能由默认值或本机 listener 推测。
+		c.ListenAddrs = []string{"/ip4/127.0.0.1/tcp/8080/ws"}
 	}
 	if c.Clock == nil {
 		c.Clock = clock.New()
@@ -206,6 +208,10 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("配置错误：hash_workers 必须在 %d..%d 之间", MinHashWorkers, MaxHashWorkers)
 	}
 
+	if err := c.ValidateNetwork(); err != nil {
+		return err
+	}
+
 	if (c.TLSCertFile == "") != (c.TLSKeyFile == "") {
 		return errors.New("配置错误：tls_cert_file 与 tls_key_file 必须同时配置")
 	}
@@ -216,20 +222,161 @@ func (c *Config) Validate() error {
 		if _, err := os.Stat(c.TLSKeyFile); err != nil {
 			return fmt.Errorf("配置错误：tls_key_file 无法读取: %w", err)
 		}
-	}
-
-	hostPart, _, err := net.SplitHostPort(c.AdminListen)
-	if err != nil {
-		return fmt.Errorf("配置错误：admin_listen 格式必须是 host:port: %w", err)
-	}
-	if hostPart != "localhost" {
-		if ip := net.ParseIP(hostPart); ip == nil || !ip.IsLoopback() {
-			if c.AdminToken == "" {
-				return errors.New("配置错误：admin_listen 监听非 loopback 地址时必须配置 admin_token")
-			}
+		if _, err := tls.LoadX509KeyPair(c.TLSCertFile, c.TLSKeyFile); err != nil {
+			return fmt.Errorf("配置错误：TLS 证书与私钥无法解析: %w", err)
 		}
 	}
 	return nil
+}
+
+// ValidateNetwork 校验 listen 与 WebRTC Direct 公网发布地址的静态关系。
+// 它不创建 socket、不解析 DNS，供 Load 和直接构造 Config 的装配方共同使用。
+func (c *Config) ValidateNetwork() error {
+	// listen 既是 libp2p 的真实绑定清单，也是 Web/WS 共享入口的 transport
+	// 清单。提前解析它，确保 direct 发布约束在任何 listener 建立前就失败。
+	features, err := validateListenAddresses(c.ListenAddrs)
+	if err != nil {
+		return err
+	}
+	if (strings.TrimSpace(c.TLSCertFile) == "") != (strings.TrimSpace(c.TLSKeyFile) == "") {
+		return errors.New("配置错误：tls_cert_file 与 tls_key_file 必须同时配置")
+	}
+	if features.hasTLSWebSocket && (strings.TrimSpace(c.TLSCertFile) == "" || strings.TrimSpace(c.TLSKeyFile) == "") {
+		return errors.New("配置错误：listen 使用 /tls/ws（WSS）时必须同时配置 tls_cert_file 与 tls_key_file")
+	}
+	if features.hasPlainWebSocket && (strings.TrimSpace(c.TLSCertFile) != "" || strings.TrimSpace(c.TLSKeyFile) != "") {
+		return errors.New("配置错误：已配置 TLS 证书时禁止裸 /ws 监听；请显式改为 /tls/ws")
+	}
+
+	publicAddresses, err := NormalizeWebRTCDirectPublicAddresses(c.WebRTCDirectPublicAddresses)
+	if err != nil {
+		return err
+	}
+	c.WebRTCDirectPublicAddresses = publicAddresses
+	if features.hasWebRTCDirect && len(publicAddresses) == 0 {
+		return errors.New("配置错误：listen 含 WebRTC Direct listener 时，webrtc_direct_public_addresses 至少配置一项")
+	}
+	if !features.hasWebRTCDirect && len(publicAddresses) > 0 {
+		return errors.New("配置错误：未监听 WebRTC Direct 时禁止配置 webrtc_direct_public_addresses；请删除该字段或增加 WebRTC Direct listener")
+	}
+	if !features.hasWebSocket {
+		return errors.New("配置错误：listen 至少需要一条 /ws 或 /tls/ws 共享 Web/WS 入口")
+	}
+	if sharedWebSocketNonLoopback(c.ListenAddrs) && strings.TrimSpace(c.AdminToken) == "" {
+		return errors.New("配置错误：listen 中共享 Web/WS 入口监听非 loopback 地址时必须配置 admin_token")
+	}
+	return nil
+}
+
+// ListenHasWebSocket 报告 listen 是否包含 WebSocket/WSS 共享 Web 入口。
+// 该方法主要供装配层和测试读取已经校验过的 transport 清单。
+func (c *Config) ListenHasWebSocket() bool {
+	for _, text := range c.ListenAddrs {
+		addr, err := ma.NewMultiaddr(strings.TrimSpace(text))
+		if err != nil {
+			continue
+		}
+		for _, protocol := range addr.Protocols() {
+			if protocol.Code == ma.P_WS || protocol.Code == ma.P_WSS {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// WebRTCDirectPublicAddrs 返回已规范化的 WebRTC Direct 公网基础地址副本。
+// 调用方不能通过修改返回切片改变配置真值。
+func (c *Config) WebRTCDirectPublicAddrs() []string {
+	return append([]string(nil), c.WebRTCDirectPublicAddresses...)
+}
+
+type listenFeatures struct {
+	hasWebRTCDirect   bool // 是否存在 WebRTC Direct listener
+	hasWebSocket      bool // 是否存在 Web/WS/WSS 共享入口
+	hasTLSWebSocket   bool // 是否存在显式 TLS WebSocket（/tls/ws 或 /wss）
+	hasPlainWebSocket bool // 是否存在裸 WebSocket（/ws）
+}
+
+func validateListenAddresses(addresses []string) (features listenFeatures, err error) {
+	if len(addresses) == 0 {
+		return listenFeatures{}, errors.New("配置错误：listen 不能为空")
+	}
+	for i, text := range addresses {
+		trimmed := strings.TrimSpace(text)
+		addr, parseErr := ma.NewMultiaddr(trimmed)
+		if parseErr != nil {
+			return listenFeatures{}, fmt.Errorf("配置错误：listen 第 %d 项不是合法的 multiaddr: %w", i+1, parseErr)
+		}
+		hasWS := false
+		hasTLS := false
+		for _, protocol := range addr.Protocols() {
+			switch protocol.Code {
+			case ma.P_WEBRTC_DIRECT:
+				features.hasWebRTCDirect = true
+			case ma.P_WS:
+				hasWS = true
+			case ma.P_WSS:
+				hasWS = true
+				hasTLS = true
+			case ma.P_TLS:
+				hasTLS = true
+			}
+		}
+		if hasWS {
+			features.hasWebSocket = true
+			if hasTLS {
+				features.hasTLSWebSocket = true
+			} else {
+				features.hasPlainWebSocket = true
+			}
+		}
+	}
+	return features, nil
+}
+
+func sharedWebSocketNonLoopback(addresses []string) bool {
+	for _, text := range addresses {
+		addr, err := ma.NewMultiaddr(strings.TrimSpace(text))
+		if err != nil {
+			continue
+		}
+		hasWebSocket := false
+		for _, protocol := range addr.Protocols() {
+			if protocol.Code == ma.P_WS || protocol.Code == ma.P_WSS {
+				hasWebSocket = true
+				break
+			}
+		}
+		if !hasWebSocket {
+			continue
+		}
+		for _, protocol := range addr.Protocols() {
+			if protocol.Code != ma.P_IP4 && protocol.Code != ma.P_IP6 {
+				continue
+			}
+			value, valueErr := addr.ValueForProtocol(protocol.Code)
+			if valueErr != nil {
+				return true
+			}
+			ip := net.ParseIP(value)
+			if ip == nil || !ip.IsLoopback() {
+				return true
+			}
+		}
+		// DNS listener 的实际绑定范围无法在静态校验时证明是 loopback，
+		// 因此按非 loopback 处理，要求运维显式保护 status/scans API。
+		if _, err := addr.ValueForProtocol(ma.P_DNS); err == nil {
+			return true
+		}
+		if _, err := addr.ValueForProtocol(ma.P_DNS4); err == nil {
+			return true
+		}
+		if _, err := addr.ValueForProtocol(ma.P_DNS6); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // WhitelistAllowed 表示 private 模式下该规范化公钥是否在白名单中。

@@ -197,6 +197,24 @@ WSS 推荐规范形态：
 - 地址优先级是本地策略，不是 wire 字段；
 - DNS、DDNS、二维码和配对流程不进入 MSFile wire，最终只产生公钥与 multiaddr。
 
+### 4.1 NAS Web 与 WSS 的部署地址来源
+
+NAS 的普通 Web 页面/API 与 libp2p WS/WSS 共用同一个源站 TCP listener：没有 HTTP Upgrade 的
+请求进入 Web Handler，WebSocket Upgrade 进入 libp2p WebSocket transport，随后仍执行 Noise、
+Yamux 和 `/msfile/1.0.0`。这只是部署分流，不增加裸 WebSocket 业务协议，也不改变 wire 语义。
+
+WSS 公网 multiaddr 不写入 NAS YAML，也不从 `listen`、`Host.Addrs()`、`Host` Header 或代理
+Header 推导。NAS Web 页面读取公开网络信息接口取得 PeerId，再用当前浏览器的
+`window.location.hostname` 和 HTTPS 有效端口生成：
+
+```text
+/ip4|ip6|dns4/<当前页面主机>/tcp/<HTTPS端口>/tls/ws/p2p/<PeerId>
+```
+
+WebRTC Direct 的公网 IP/DNS 与 UDP 端口则必须由 NAS YAML 的
+`webrtc_direct_public_addresses` 显式提供；服务运行时只补齐 listener 产生的 `certhash` 和
+PeerId。两种地址都不是“显示出来即已验证公网可达”。
+
 ---
 
 ## 5. Transport 行为

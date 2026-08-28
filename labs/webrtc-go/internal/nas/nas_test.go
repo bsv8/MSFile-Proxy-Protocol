@@ -4,7 +4,7 @@ package nas
 //   T25 第二实例 service.lock 拒绝、有界优雅停止（含锁释放）
 //   T26 旧 schema/objects 检测后 fail closed，不自动删除，中文报错
 //
-// 启动顺序本身由 New 的装配路径保证：锁先于数据库，数据库先于监听。
+// 启动顺序本身由 New 的装配路径保证：锁先于数据库，正式协议注册先于共享 listener。
 
 import (
 	"bytes"
@@ -12,6 +12,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -20,6 +21,7 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"os"
@@ -72,18 +74,19 @@ func testConfig(t *testing.T) *config.Config {
 		}
 	}
 	return &config.Config{
-		IdentityKeyFile:    writeTestKey(t),
-		NASData:            nasRoot,
-		SeedData:           seedDir,
-		AccessMode:         config.AccessModePrivate,
-		PublicKeyWhitelist: []string{},
-		FullScanInterval:   config.Duration(time.Hour),
-		FileStableInterval: config.Duration(10 * time.Millisecond),
-		InvalidRetention:   config.Duration(24 * time.Hour),
-		HashWorkers:        1,
-		ListenAddrs:        []string{"/ip4/127.0.0.1/udp/0/webrtc-direct", "/ip4/127.0.0.1/tcp/0/ws"},
-		AdminListen:        "127.0.0.1:0",
-		Clock:              clock.New(),
+		IdentityKeyFile:             writeTestKey(t),
+		NASData:                     nasRoot,
+		SeedData:                    seedDir,
+		AccessMode:                  config.AccessModePrivate,
+		PublicKeyWhitelist:          []string{},
+		FullScanInterval:            config.Duration(time.Hour),
+		FileStableInterval:          config.Duration(10 * time.Millisecond),
+		InvalidRetention:            config.Duration(24 * time.Hour),
+		HashWorkers:                 1,
+		ListenAddrs:                 []string{"/ip4/127.0.0.1/udp/0/webrtc-direct", "/ip4/127.0.0.1/tcp/0/ws"},
+		WebRTCDirectPublicAddresses: []string{"/ip4/203.0.113.10/udp/4001/webrtc-direct"},
+		AdminListen:                 "127.0.0.1:0",
+		Clock:                       clock.New(),
 	}
 }
 
@@ -204,7 +207,7 @@ func mustTimeoutCtx(t *testing.T) context.Context {
 }
 
 // TestAdminPortConflictRollsBackEverything（阻断 4）：
-// 管理端口被占用时 New 必须中文报错，并逆序释放 host/DB/锁——
+// 共享 Web/WS 端口被占用时 New 必须中文报错，并逆序释放 host/DB/锁——
 // 证据是随后同 seed_data 的新实例可以立即取得锁启动。
 func TestAdminPortConflictRollsEverythingBack(t *testing.T) {
 	// 先占用一个端口。
@@ -216,7 +219,10 @@ func TestAdminPortConflictRollsEverythingBack(t *testing.T) {
 	port := squatter.Addr().(*net.TCPAddr).Port
 
 	cfg := testConfig(t)
-	cfg.AdminListen = fmt.Sprintf("127.0.0.1:%d", port)
+	cfg.ListenAddrs = []string{
+		"/ip4/127.0.0.1/udp/0/webrtc-direct",
+		fmt.Sprintf("/ip4/127.0.0.1/tcp/%d/ws", port),
+	}
 
 	app, err := New(cfg)
 	if err == nil {
@@ -230,9 +236,9 @@ func TestAdminPortConflictRollsEverythingBack(t *testing.T) {
 	}
 
 	// 回滚完整性：锁已释放、DB 已关闭 → 新实例可立即用同一 seed_data 启动
-	// （换一个空闲管理端口，只验证锁与资源回收）。
+	// （换一个空闲共享入口端口，只验证锁与资源回收）。
 	againCfg := testConfigWithSameSeedData(t, cfg)
-	againCfg.AdminListen = "127.0.0.1:0"
+	againCfg.ListenAddrs = []string{"/ip4/127.0.0.1/udp/0/webrtc-direct", "/ip4/127.0.0.1/tcp/0/ws"}
 	again, err := New(againCfg)
 	if err != nil {
 		t.Fatalf("回滚后新实例应能立即启动（锁与 DB 均已释放），实际: %v", err)
@@ -254,6 +260,7 @@ func TestTLSConfigRequiresExplicitWSSListener(t *testing.T) {
 	cfg.TLSCertFile = certFile
 	cfg.TLSKeyFile = keyFile
 	cfg.ListenAddrs = []string{"/ip4/127.0.0.1/tcp/0/ws"} // 裸 WS + 证书：非法组合
+	cfg.WebRTCDirectPublicAddresses = nil
 	if app, err := New(cfg); err == nil {
 		_ = app.Shutdown(mustTimeoutCtx(t))
 		t.Fatal("证书 + 裸 /ws 的组合必须被拒绝")
@@ -262,8 +269,9 @@ func TestTLSConfigRequiresExplicitWSSListener(t *testing.T) {
 	}
 }
 
-// TestFullAssemblyServesStatOverWSS（阻断 3 端到端）：
-// 配置 → nas.New → ServiceMultiaddrs 含 /tls/ws → 客户端经 TLS+Noise+PeerId 完成 Stat。
+// TestFullAssemblyServesStatOverWSS（G08 端到端）：
+// 配置 → nas.New → ServiceMultiaddrs 含 /tls/ws → 同一 WSS connection 上分别打开
+// Stat/Read 两条 stream，并校验 Seed 与每个文件块的真实 attachment。
 func TestFullAssemblyServesStatOverWSS(t *testing.T) {
 	cfg := testConfig(t)
 	certFile, keyFile := writeSelfSignedCert(t)
@@ -386,6 +394,94 @@ func TestFullAssemblyServesStatOverWSS(t *testing.T) {
 	}
 	if len(fields) != 7 || fields[3] != uint64(1) {
 		t.Fatalf("WSS 正式链路 Stat 应回复 available: %#v", fields)
+	}
+
+	// Read 使用同一 connection 上的另一条长驻 stream；依次读取 Seed 和全部块，
+	// 每个 attachment 都按请求 hash 做 SHA-256 校验，覆盖真实二进制响应而非只测 Header。
+	readStream, err := clientHost.NewStream(ctx, app2.Host().ID(), protocol.ID(msfile.ProtocolID))
+	if err != nil {
+		t.Fatalf("同一 WSS connection 建立独立 Read stream 失败: %v", err)
+	}
+	if stream.Conn().ID() != readStream.Conn().ID() {
+		t.Fatalf("Stat 与 Read 必须复用同一 WSS connection，实际连接不同")
+	}
+	defer readStream.Close()
+	readVerified := func(hash [32]byte, requestID uint64) []byte {
+		if err := msfile.EncodeRequest(readStream, []any{uint64(1), uint64(3), requestID, hash[:], uint64(0)}); err != nil {
+			t.Fatal(err)
+		}
+		response, err := msfile.DecodeResponseFields(readStream)
+		if err != nil {
+			t.Fatalf("解码 WSS Read 响应失败: %v", err)
+		}
+		if len(response) != 5 || response[1] != uint64(4) {
+			t.Fatalf("WSS Read 应回复 ReadResponse，实际 %#v", response)
+		}
+		responseHash, ok := response[3].([]byte)
+		if !ok || !bytes.Equal(responseHash, hash[:]) {
+			t.Fatalf("WSS Read 响应 hash 不匹配: %#v", response)
+		}
+		length, ok := response[4].(uint64)
+		if !ok {
+			t.Fatalf("WSS Read 响应 content_length 类型错误: %#v", response)
+		}
+		data := make([]byte, length)
+		if _, err := io.ReadFull(readStream, data); err != nil {
+			t.Fatalf("读取 WSS Read attachment 失败: %v", err)
+		}
+		if digest := sha256.Sum256(data); digest != hash {
+			t.Fatalf("WSS Read attachment SHA-256 不匹配: len=%d", len(data))
+		}
+		return data
+	}
+	if got := readVerified(hashArr, 100); !bytes.Equal(got, res.Seed) {
+		t.Fatal("WSS Read 返回的 Seed 与预期不一致")
+	}
+	for _, block := range res.Blocks {
+		var blockHash [32]byte
+		copy(blockHash[:], block.Hash[:])
+		got := readVerified(blockHash, uint64(200+block.Index))
+		if len(got) != block.Length {
+			t.Fatalf("WSS Read 块 %d 长度不符: %d != %d", block.Index, len(got), block.Length)
+		}
+	}
+	_ = readStream.CloseWrite()
+
+	// G09：白名单外的真实 secp256k1 客户端不能读取内容。实现允许在 connection
+	// 层先完成 Noise，再由 MSFile stream 返回 unauthorized_peer；两种拒绝点都算失败关闭。
+	strangerPriv, _, err := crypto.GenerateSecp256k1Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	strangerHost, err := libp2p.New(
+		libp2p.Identity(strangerPriv),
+		libp2p.NoListenAddrs,
+		libp2p.Transport(websocket.New, websocket.WithTLSClientConfig(&tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12})),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer strangerHost.Close()
+	rejected := false
+	if err := strangerHost.Connect(ctx, peer.AddrInfo{ID: app2.Host().ID(), Addrs: app2.Host().Addrs()}); err != nil {
+		rejected = true
+	} else {
+		strangerStream, streamErr := strangerHost.NewStream(ctx, app2.Host().ID(), protocol.ID(msfile.ProtocolID))
+		if streamErr != nil {
+			rejected = true
+		} else {
+			if encodeErr := msfile.EncodeRequest(strangerStream, []any{uint64(1), uint64(1), uint64(1), hashArr[:]}); encodeErr != nil {
+				rejected = true
+			} else {
+				_ = strangerStream.CloseWrite()
+				denied, decodeErr := msfile.DecodeResponseFields(strangerStream)
+				rejected = decodeErr != nil || (len(denied) >= 5 && denied[1] == uint64(255) && denied[4] == "unauthorized_peer")
+			}
+			_ = strangerStream.Close()
+		}
+	}
+	if !rejected {
+		t.Fatal("非白名单 WSS 客户端不应获得 Stat/Read 响应")
 	}
 }
 

@@ -26,6 +26,72 @@
         <p class="hero-copy">按文件名或 Seed Hash 前缀检索已完成索引的文件，打开详情即可下载。</p>
       </section>
 
+      <section class="network-section" aria-labelledby="network-title">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">NETWORK ACCESS</p>
+            <h2 id="network-title">网络接入地址</h2>
+          </div>
+          <p class="network-state" id="network-state" aria-live="polite">加载中…</p>
+        </div>
+
+        <div class="network-error" id="network-error" role="alert" hidden></div>
+
+        <div id="network-content" hidden>
+          <dl class="network-identity">
+            <div>
+              <dt>NAS PeerId</dt>
+              <dd class="copy-value-row">
+                <code id="network-peer-id"></code>
+                <button class="copy-button" type="button" data-copy-target="network-peer-id">复制</button>
+              </dd>
+            </div>
+            <div>
+              <dt>NAS 压缩公钥（secp256k1 hex）</dt>
+              <dd class="copy-value-row">
+                <code id="network-public-key"></code>
+                <button class="copy-button" type="button" data-copy-target="network-public-key">复制</button>
+              </dd>
+            </div>
+          </dl>
+
+          <div class="network-addresses" id="network-addresses">
+            <article class="address-card">
+              <div class="address-card-topline">
+                <div>
+                  <p class="address-transport">WSS</p>
+                  <h3>浏览器安全 WebSocket</h3>
+                </div>
+                <span class="address-badge">TCP / TLS</span>
+              </div>
+              <div class="address-value-row" id="wss-address-row">
+                <code class="address-value" id="wss-address"></code>
+                <button class="copy-button" id="copy-wss" type="button" data-copy-target="wss-address">复制</button>
+              </div>
+              <p class="address-note" id="wss-note">经 Cloudflare TCP/TLS；地址使用当前浏览器页面的域名和端口生成。</p>
+            </article>
+
+            <div class="direct-address-list" id="direct-address-list">
+              <div class="address-card direct-empty" id="direct-empty" hidden>
+                <div class="address-card-topline">
+                  <div>
+                    <p class="address-transport">WebRTC Direct</p>
+                    <h3>公网 UDP 直连</h3>
+                  </div>
+                  <span class="address-badge">UDP</span>
+                </div>
+                <p class="address-note">当前未配置 WebRTC Direct 公网发布地址。</p>
+              </div>
+            </div>
+          </div>
+
+          <p class="same-host-note" id="same-host-note" hidden>
+            WSS 使用 TCP/TLS，WebRTC Direct 使用公网 UDP。两者虽使用同一域名和 PeerId，仍是两条独立的网络路径。若该域名为 Cloudflare 普通橙云记录，其 DNS 返回 Cloudflare 地址，WebRTC Direct UDP 通常无法到达 NAS；请确认该名称也能把 UDP 直接导向 NAS。
+          </p>
+          <p class="network-disclaimer">页面只展示配置和运行时生成的地址，不代表已经从外网验证可达。</p>
+        </div>
+      </section>
+
       <section class="index-section" aria-labelledby="index-title">
         <div class="section-heading">
           <div>
@@ -117,6 +183,6 @@
     </footer>
   </div>
 
-  <script src="/app.js"></script>
+  <script type="module" src="/app.js"></script>
 </body>
 </html>

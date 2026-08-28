@@ -4,8 +4,14 @@ package config
 // 只使用标准库 testing 与项目内部包，不引入第三方断言库。
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	crand "crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,7 +29,7 @@ type layout struct {
 	nasDir   string // 用户原文件根目录；必须真实存在才能通过校验
 	seedDir  string // 派生数据根目录；故意不预建，由 Load 内部的 MkdirAll 创建
 	keyFile  string // 私钥文件路径；Validate 仅 stat 要求存在，不读内容
-	certFile string // TLS 证书占位空文件；成对存在性校验同样只 stat
+	certFile string // TLS 证书占位空文件；用于测试缺失/非法证书分支
 }
 
 // newLayout 在临时目录中准备 nas 根目录、私钥占位文件与证书占位文件。
@@ -60,7 +66,7 @@ const (
 	lineRetention  = "invalid_retention: 24h"   // 派生数据保留时间
 	lineHashWorker = "hash_workers: 2"          // Seed 计算 worker 数
 	lineWatcherOn  = "enable_file_watcher: true"
-	lineAdmin      = `admin_listen: "127.0.0.1:8080"` // Web 管理台监听地址
+	lineAdmin      = `admin_listen: "127.0.0.1:8080"` // 已弃用的旧兼容字段
 )
 
 // baseYAML 返回一份带中文注释、全部字段显式给出的合法 private 模式配置文本。
@@ -84,8 +90,12 @@ func (l layout) baseYAML(pubKeys []string) string {
 	b.WriteString(lineStable + "\n")
 	b.WriteString(lineRetention + "\n")
 	b.WriteString(lineHashWorker + "\n")
+	b.WriteString("# 中文注释：公网发布地址只填写 WebRTC Direct 基础段，运行时补齐 certhash/PeerId\n")
+	b.WriteString("webrtc_direct_public_addresses:\n")
+	b.WriteString("  - \"/ip4/203.0.113.10/udp/4001/webrtc-direct\"\n")
 	b.WriteString("listen:\n")
 	b.WriteString("  - \"/ip4/127.0.0.1/udp/4001/webrtc-direct\"\n")
+	b.WriteString("  - \"/ip4/127.0.0.1/tcp/8080/ws\"\n")
 	b.WriteString(lineAdmin + "\n")
 	b.WriteString(lineWatcherOn + "\n")
 	return b.String()
@@ -162,6 +172,44 @@ func newCompressedPubKeyHex(t *testing.T) string {
 	}
 	t.Fatal("多次尝试仍无法生成合法的 secp256k1 压缩公钥")
 	return ""
+}
+
+// writeValidTLSFiles 生成一对可被 tls.LoadX509KeyPair 解析的测试证书与私钥。
+// 证书只用于 --check-config 的静态解析测试，不代表生产证书配置。
+func writeValidTLSFiles(t *testing.T) (string, string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), crand.Reader)
+	if err != nil {
+		t.Fatalf("生成测试 TLS 私钥失败: %v", err)
+	}
+	template := x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "msfile-config-test"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"localhost"},
+	}
+	der, err := x509.CreateCertificate(crand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("生成测试 TLS 证书失败: %v", err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("编码测试 TLS 私钥失败: %v", err)
+	}
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "cert.pem")
+	keyPath := filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatalf("写入测试 TLS 证书失败: %v", err)
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatalf("写入测试 TLS 私钥失败: %v", err)
+	}
+	return certPath, keyPath
 }
 
 // --- T01 场景开始 -------------------------------------------------------
@@ -366,11 +414,11 @@ func TestDefaultsAppliedWhenFieldsOmitted(t *testing.T) {
 	if cfg.HashWorkers != MinHashWorkers {
 		t.Fatalf("hash_workers 默认应为 %d，实际 %d", MinHashWorkers, cfg.HashWorkers)
 	}
-	if cfg.AdminListen != "127.0.0.1:8080" {
-		t.Fatalf("admin_listen 默认应只监听 loopback，实际 %q", cfg.AdminListen)
+	if cfg.AdminListen != "" {
+		t.Fatalf("admin_listen 未配置时应保持为空（已弃用且不参与运行），实际 %q", cfg.AdminListen)
 	}
-	if len(cfg.ListenAddrs) != 2 {
-		t.Fatalf("listen 默认应提供 2 个 multiaddr，实际 %d 个: %q", len(cfg.ListenAddrs), cfg.ListenAddrs)
+	if len(cfg.ListenAddrs) != 1 || cfg.ListenAddrs[0] != "/ip4/127.0.0.1/tcp/8080/ws" {
+		t.Fatalf("listen 默认应提供 loopback 共享 Web/WS 地址，实际 %q", cfg.ListenAddrs)
 	}
 	if !cfg.WatcherEnabled() {
 		t.Fatal("enable_file_watcher 未配置时应默认开启")
@@ -390,7 +438,7 @@ func TestHashWorkersBounds(t *testing.T) {
 	}
 }
 
-// 场景 11：tls_cert_file 与 tls_key_file 必须成对出现；成对存在即通过。
+// 场景 11：TLS 文件必须成对出现，且成对内容必须能被解析。
 func TestTLSCertKeyPairing(t *testing.T) {
 	l := newLayout(t)
 	base := l.baseYAML(nil)
@@ -406,41 +454,65 @@ func TestTLSCertKeyPairing(t *testing.T) {
 	})
 
 	t.Run("成对存在通过校验", func(t *testing.T) {
-		// 校验只 stat 不解析 PEM 内容，两个路径可以指向同一个空文件
-		content := base +
-			fmt.Sprintf("tls_cert_file: %q\n", l.certFile) +
-			fmt.Sprintf("tls_key_file: %q\n", l.certFile)
+		certFile, keyFile := writeValidTLSFiles(t)
+		// /tls/ws 明确表示由 NAS 终止 TLS；--check-config 必须同时验证证书内容。
+		tlsBase := replaceLine(t, base, `  - "/ip4/127.0.0.1/tcp/8080/ws"`, `  - "/ip4/127.0.0.1/tcp/8080/tls/ws"`)
+		content := tlsBase +
+			fmt.Sprintf("tls_cert_file: %q\n", certFile) +
+			fmt.Sprintf("tls_key_file: %q\n", keyFile)
 		cfg := mustLoad(t, content)
-		if cfg.TLSCertFile != cfg.TLSKeyFile {
+		if cfg.TLSCertFile != certFile || cfg.TLSKeyFile != keyFile {
 			t.Fatalf("成对配置应被完整接受: %q / %q", cfg.TLSCertFile, cfg.TLSKeyFile)
 		}
 	})
 }
 
-// 场景 12：admin_listen 监听非 loopback 地址时必须配置 admin_token。
-func TestAdminListenTokenRequirement(t *testing.T) {
+// 场景 12：admin_listen 仅作为旧配置兼容字段，不能改变实际 listener 或安全校验。
+func TestAdminListenIsDeprecatedAndIgnored(t *testing.T) {
 	l := newLayout(t)
 	base := l.baseYAML(nil)
 
-	t.Run("0.0.0.0 无 token 报错", func(t *testing.T) {
+	t.Run("格式错误也不参与校验", func(t *testing.T) {
 		content := replaceLine(t, base, lineAdmin, `admin_listen: "0.0.0.0:8080"`)
-		wantLoadErr(t, content, "admin_listen 监听非 loopback 地址时必须配置 admin_token")
-	})
-
-	t.Run("0.0.0.0 带 token 通过", func(t *testing.T) {
-		content := replaceLine(t, base, lineAdmin,
-			"admin_listen: \"0.0.0.0:8080\"\n"+`admin_token: "test-secret-token"`)
+		content = replaceLine(t, content, `admin_listen: "0.0.0.0:8080"`, `admin_listen: "不是 host:port"`)
 		cfg := mustLoad(t, content)
-		if cfg.AdminToken != "test-secret-token" {
-			t.Fatalf("admin_token 应被原样加载，实际 %q", cfg.AdminToken)
+		if cfg.AdminListen != "不是 host:port" {
+			t.Fatalf("旧字段应原样保留供弃用提示，实际 %q", cfg.AdminListen)
 		}
 	})
 
-	t.Run("127.0.0.1 无 token 通过", func(t *testing.T) {
-		cfg := mustLoad(t, base) // 基准配置即 loopback 无 token
-		if cfg.AdminListen != "127.0.0.1:8080" {
-			t.Fatalf("admin_listen 应保持 %q，实际 %q", "127.0.0.1:8080", cfg.AdminListen)
-		}
+	t.Run("旧字段非 loopback 不会放宽共享入口安全校验", func(t *testing.T) {
+		content := replaceLine(t, base, lineAdmin,
+			`admin_listen: "0.0.0.0:8080"`)
+		content = replaceLine(t, content, `  - "/ip4/127.0.0.1/tcp/8080/ws"`, `  - "/ip4/0.0.0.0/tcp/8080/ws"`)
+		wantLoadErr(t, content, "listen 中共享 Web/WS 入口监听非 loopback 地址时必须配置 admin_token")
+	})
+}
+
+// 场景 13：TLS/listener 错配必须在 Load（即 msfile-nas --check-config 路径）阶段失败，
+// 不能等到 nas.New/buildHost 才发现。
+func TestCheckConfigRejectsTLSListenerMismatch(t *testing.T) {
+	l := newLayout(t)
+	base := l.baseYAML(nil)
+	tlsBase := replaceLine(t, base, `  - "/ip4/127.0.0.1/tcp/8080/ws"`, `  - "/ip4/127.0.0.1/tcp/8080/tls/ws"`)
+
+	t.Run("tls/ws 缺少证书私钥", func(t *testing.T) {
+		wantLoadErr(t, tlsBase, "/tls/ws（WSS）时必须同时配置")
+	})
+
+	t.Run("配置证书但仍使用裸 ws", func(t *testing.T) {
+		certFile, keyFile := writeValidTLSFiles(t)
+		content := base +
+			fmt.Sprintf("tls_cert_file: %q\n", certFile) +
+			fmt.Sprintf("tls_key_file: %q\n", keyFile)
+		wantLoadErr(t, content, "禁止裸 /ws 监听")
+	})
+
+	t.Run("tls/ws 的证书内容非法", func(t *testing.T) {
+		content := tlsBase +
+			fmt.Sprintf("tls_cert_file: %q\n", l.certFile) +
+			fmt.Sprintf("tls_key_file: %q\n", l.certFile)
+		wantLoadErr(t, content, "TLS 证书与私钥无法解析")
 	})
 }
 

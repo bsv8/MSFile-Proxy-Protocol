@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"msfile.dev/labs/webrtc-go/internal/content"
@@ -37,16 +38,72 @@ type Coordinator interface {
 	TriggerFullScan() bool // 请求触发一轮全量扫描；已有扫描进行中时返回 false
 }
 
+// NetworkInfo 保存公开网络信息与运维 listener 信息。
+//
+// PeerId、公钥和 WebRTC Direct 地址会出现在公开接口；ListenAddresses
+// 只用于受保护的 /api/status。字段全部附中文含义，避免把两种地址口径混用。
+type NetworkInfo struct {
+	PeerID                      string   // NAS 业务私钥派生的 libp2p PeerId
+	SupplierPublicKey           string   // NAS 的 33 字节压缩 secp256k1 公钥 hex
+	ListenAddresses             []string // 本机实际绑定/运行的 transport 地址（/api/status）
+	WebRTCDirectPublicAddresses []string // YAML 配置的 WebRTC Direct 公网基础地址（/api/status）
+	WebRTCDirectAddresses       []string // 已补齐 certhash 与 PeerId 的公网 WebRTC Direct 地址
+	ready                       bool     // 运行时地址是否已完成初始化；未就绪时公开接口返回 503
+
+	mu sync.RWMutex
+}
+
+// SetRuntime 写入运行中 host 产生的地址快照；切片会被复制，调用方可安全复用原切片。
+func (n *NetworkInfo) SetRuntime(listenAddresses, publicBases, directAddresses []string) {
+	if n == nil {
+		return
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.ListenAddresses = cloneStrings(listenAddresses)
+	n.WebRTCDirectPublicAddresses = cloneStrings(publicBases)
+	n.WebRTCDirectAddresses = cloneStrings(directAddresses)
+	n.ready = true
+}
+
+type networkSnapshot struct {
+	peerID                      string
+	supplierPublicKey           string
+	listenAddresses             []string
+	webRTCDirectPublicAddresses []string
+	webRTCDirectAddresses       []string
+	ready                       bool
+}
+
+func (n *NetworkInfo) snapshot() networkSnapshot {
+	if n == nil {
+		return networkSnapshot{}
+	}
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return networkSnapshot{
+		peerID:                      n.PeerID,
+		supplierPublicKey:           n.SupplierPublicKey,
+		listenAddresses:             cloneStrings(n.ListenAddresses),
+		webRTCDirectPublicAddresses: cloneStrings(n.WebRTCDirectPublicAddresses),
+		webRTCDirectAddresses:       cloneStrings(n.WebRTCDirectAddresses),
+		ready:                       n.ready,
+	}
+}
+
 // Options 是公共内容服务构造参数。
 type Options struct {
-	Reader        *content.Reader // 内容读取器；公共下载从它打开安全文件副本
-	AdminToken    string          // 兼容运维 API 的 Bearer Token；公共内容 API 不需要
-	PeerID        string          // 供应商 PeerId
-	PublicKey     string          // 供应商压缩公钥 hex
-	Addresses     []string        // 对外 MSFile multiaddr 列表
-	AccessMode    string          // private / public；只用于兼容运维信息展示
-	WhitelistSize int             // private 白名单条数；只展示数量，不返回公钥本身
-	Retention     time.Duration   // invalid 派生数据保留期，用于兼容运维信息
+	Reader                      *content.Reader // 内容读取器；公共下载从它打开安全文件副本
+	AdminToken                  string          // 兼容运维 API 的 Bearer Token；公共内容 API 不需要
+	PeerID                      string          // 供应商 PeerId
+	PublicKey                   string          // 供应商压缩公钥 hex
+	Addresses                   []string        // 兼容旧调用方的本机 listener 地址；/api/status 使用
+	WebRTCDirectPublicAddresses []string        // 兼容旧调用方的 YAML WebRTC Direct 公网基础地址
+	WebRTCDirectAddresses       []string        // 兼容旧调用方的完整 WebRTC Direct 公网地址
+	NetworkInfo                 *NetworkInfo    // 运行时网络信息；用于在 host 监听后填充地址
+	AccessMode                  string          // private / public；只用于兼容运维信息展示
+	WhitelistSize               int             // private 白名单条数；只展示数量，不返回公钥本身
+	Retention                   time.Duration   // invalid 派生数据保留期，用于兼容运维信息
 }
 
 // New 创建公共内容服务 http.Handler。
@@ -67,6 +124,10 @@ func New(db *indexdb.DB, coord Coordinator, options Options) http.Handler {
 	mux.HandleFunc("/api/files/{seed_hash}", server.methodNotAllowed)
 	mux.HandleFunc("GET /api/files/{seed_hash}/download", server.download)
 	mux.HandleFunc("/api/files/{seed_hash}/download", server.methodNotAllowed)
+	// 网络信息是拨号方建立连接前需要的公开最小信息；不返回 WSS 地址，
+	// WSS 必须由当前浏览器页面 URL 在前端生成。
+	mux.HandleFunc("GET /api/network-info", server.networkInfo)
+	mux.HandleFunc("/api/network-info", server.methodNotAllowed)
 
 	// 兼容已有运维脚本的 API；公共页面不调用这些接口。
 	mux.HandleFunc("GET /api/status", server.protect(server.status))
@@ -96,15 +157,14 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-// protect 校验管理 Bearer Token。access_mode=public 不改变管理面的认证要求。
+// protect 始终校验管理 Bearer Token。access_mode=public 不改变管理面的认证要求；
+// 即使配置没有 token，也不能把 /api/status 退化成公开接口。
 func (s *Server) protect(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.options.AdminToken != "" {
-			token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if subtle.ConstantTimeCompare([]byte(token), []byte(s.options.AdminToken)) != 1 {
-				writeError(w, http.StatusUnauthorized, "admin_token_invalid", "管理令牌无效或缺失")
-				return
-			}
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if s.options.AdminToken == "" || subtle.ConstantTimeCompare([]byte(token), []byte(s.options.AdminToken)) != 1 {
+			writeError(w, http.StatusUnauthorized, "admin_token_invalid", "管理令牌无效或缺失")
+			return
 		}
 		next(w, r)
 	}
@@ -141,21 +201,70 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	if err == nil && len(scans) > 0 {
 		lastScan = &scans[0]
 	}
+	network := s.network()
 	writeJSON(w, 200, map[string]any{
-		"service_status":      "running",
-		"service_status_zh":   "运行中",
-		"time":                time.Now().UTC().Format(time.RFC3339),
-		"peer_id":             s.options.PeerID,                         // 供应商 PeerId
-		"supplier_public_key": s.options.PublicKey,                      // 供应商压缩公钥
-		"listen_addresses":    s.options.Addresses,                      // 对外 multiaddr
-		"access_mode":         s.options.AccessMode,                     // private / public
-		"whitelist_size":      s.options.WhitelistSize,                  // 白名单条数（不含内容）
-		"counts":              counts,                                   // 内容与位置统计
-		"scan_running":        s.coord.Scanning(),                       // 是否正在全量扫描
-		"queue_depth":         s.coord.QueueDepth(),                     // 待处理路径队列深度
-		"last_scan":           lastScan,                                 // 最近一次扫描记录
-		"retention_seconds":   int64(s.options.Retention / time.Second), // 失效保留期
+		"service_status":                 "running",
+		"service_status_zh":              "运行中",
+		"time":                           time.Now().UTC().Format(time.RFC3339),
+		"peer_id":                        network.peerID,                           // 供应商 PeerId
+		"supplier_public_key":            network.supplierPublicKey,                // 供应商压缩公钥
+		"listen_addresses":               network.listenAddresses,                  // 本机实际绑定/运行地址
+		"webrtc_direct_public_addresses": network.webRTCDirectPublicAddresses,      // 配置的公网基础地址
+		"access_mode":                    s.options.AccessMode,                     // private / public
+		"whitelist_size":                 s.options.WhitelistSize,                  // 白名单条数（不含内容）
+		"counts":                         counts,                                   // 内容与位置统计
+		"scan_running":                   s.coord.Scanning(),                       // 是否正在全量扫描
+		"queue_depth":                    s.coord.QueueDepth(),                     // 待处理路径队列深度
+		"last_scan":                      lastScan,                                 // 最近一次扫描记录
+		"retention_seconds":              int64(s.options.Retention / time.Second), // 失效保留期
 	})
+}
+
+// networkInfo 返回拨号方所需的最小公开网络信息。
+// 它不要求 admin_token，也不返回 WSS multiaddr、内部 listener 或任何运维字段。
+func (s *Server) networkInfo(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	network := s.network()
+	if !network.ready {
+		writeError(w, http.StatusServiceUnavailable, "network_info_not_ready", "网络信息尚未准备完成，请稍后重试")
+		return
+	}
+	directAddresses := network.webRTCDirectAddresses
+	if directAddresses == nil {
+		directAddresses = []string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"peer_id":                 network.peerID,
+		"supplier_public_key":     network.supplierPublicKey,
+		"webrtc_direct_addresses": directAddresses,
+	})
+}
+
+func (s *Server) network() networkSnapshot {
+	hasRuntimeNetworkInfo := s.options.NetworkInfo != nil
+	network := s.options.NetworkInfo.snapshot()
+	if !hasRuntimeNetworkInfo {
+		// 没有运行时容器时，旧嵌入调用方提供的 Options 即是完整静态快照。
+		network.ready = true
+	}
+	// 保留 Options 中的静态字段兼容现有测试和嵌入调用方；正式 NAS 使用
+	// NetworkInfo 在 listener 建立后写入的运行时快照。
+	if network.peerID == "" {
+		network.peerID = s.options.PeerID
+	}
+	if network.supplierPublicKey == "" {
+		network.supplierPublicKey = s.options.PublicKey
+	}
+	if network.listenAddresses == nil {
+		network.listenAddresses = cloneStrings(s.options.Addresses)
+	}
+	if network.webRTCDirectPublicAddresses == nil {
+		network.webRTCDirectPublicAddresses = cloneStrings(s.options.WebRTCDirectPublicAddresses)
+	}
+	if network.webRTCDirectAddresses == nil {
+		network.webRTCDirectAddresses = cloneStrings(s.options.WebRTCDirectAddresses)
+	}
+	return network
 }
 
 func (s *Server) listFiles(w http.ResponseWriter, r *http.Request) {
@@ -373,4 +482,11 @@ func writeError(w http.ResponseWriter, status int, code, messageZh string) {
 		"error_message_zh": messageZh,
 		"timestamp":        time.Now().UTC().Format(time.RFC3339),
 	})
+}
+
+func cloneStrings(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	return append([]string(nil), values...)
 }

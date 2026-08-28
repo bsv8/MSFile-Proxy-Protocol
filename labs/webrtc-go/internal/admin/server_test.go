@@ -5,11 +5,8 @@ package admin
 // 方法限制与已删除的 clients 路由、静态页面以及绝对路径不外泄。
 // 只使用标准库 testing + net/http/httptest；不修改任何源码。
 //
-// 已知源码缺陷说明（不在本文件内修复）：
-// admin.New（server.go）注册的路由表在 Go 1.22+ 的 ServeMux 冲突规则下
-// 注册即 panic（"HEAD /" 与 "GET /api/status" 等模式互斥），因此路由镜像
-// newTestHandler 复刻 New 的全部处理器与语义，仅调整静态根的注册方式；
-// TestNewRouteRegistrationHealth 会持续探测 New 是否恢复可用。
+// newTestHandler 使用独立的测试数据库装配同一组路由；
+// TestNewRouteRegistrationHealth 额外持续探测正式 New 的路由注册可用性。
 // 另注：indexdb.GetAvailability 存在的时间戳扫描缺陷会使 Stat/ReadSeed
 // 失效（详见 internal/content/reader_test.go），但管理台查询路径未受影响。
 
@@ -23,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -119,10 +117,8 @@ func insertSeedRow(t *testing.T, raw *sql.DB, seedHash, relativePath, filename, 
 }
 
 // newTestHandler 搭建带两条已索引内容的管理台测试环境。
-//
-// 路由部分逐行复刻 server.go 中 New 的注册表，仅省略与
-// "GET /api/*" 冲突的 "HEAD /" 一行（见文件头缺陷说明 1），
-// 其余语义（方法兜底 405、/api/ 兜底 404、静态页）保持一致。
+// 路由部分逐行复刻 server.go 中 New 的注册表，静态根采用无方法模式；
+// 其余语义（公共内容、管理 API 认证、方法兜底 405、/api/ 兜底 404）保持一致。
 func newTestHandler(t *testing.T) *adminTest {
 	t.Helper()
 	root := t.TempDir()
@@ -151,19 +147,17 @@ func newTestHandler(t *testing.T) *adminTest {
 	mux := http.NewServeMux()
 	assets, _ := fs.Sub(webFiles, "web")
 	fileServer := http.FileServer(http.FS(assets))
-	// 静态根注册为无方法的 "/"：在 Go 1.26 的 ServeMux 冲突规则下，
-	// 带方法的 "GET /" 与源码中的方法兜底路由（如 "/api/scans"）无法共存；
-	// 无方法 "/" 与全部子模式构成严格包含关系，可安全镜像其余注册。
-	// 与源码的语义差异仅限非 GET 的静态资源请求（本文件未测试该场景）。
+	// 静态根注册为无方法的 "/"，与带方法的 API 子路由保持严格包含关系。
 	mux.Handle("/", securityHeaders(fileServer))
-	// 注意：这里刻意没有注册源码中的 mux.Handle("HEAD /", ...)，原因见上。
 
 	mux.HandleFunc("GET /api/status", server.protect(server.status))
 	mux.HandleFunc("/api/status", server.methodNotAllowed)
-	mux.HandleFunc("GET /api/files", server.protect(server.listFiles))
+	mux.HandleFunc("GET /api/files", server.listFiles)
 	mux.HandleFunc("/api/files", server.methodNotAllowed)
-	mux.HandleFunc("GET /api/files/{seed_hash}", server.protect(server.fileDetail))
+	mux.HandleFunc("GET /api/files/{seed_hash}", server.fileDetail)
 	mux.HandleFunc("/api/files/{seed_hash}", server.methodNotAllowed)
+	mux.HandleFunc("GET /api/network-info", server.networkInfo)
+	mux.HandleFunc("/api/network-info", server.methodNotAllowed)
 	mux.HandleFunc("GET /api/scans", server.protect(server.listScans))
 	mux.HandleFunc("POST /api/scans", server.protect(server.triggerScan))
 	mux.HandleFunc("/api/scans", server.methodNotAllowed)
@@ -314,6 +308,146 @@ func TestStatusRequiresBearerTokenAndReportsConfig(t *testing.T) {
 	}
 	if payload["scan_running"] != false {
 		t.Fatalf("scan_running 应来自协调器: %s", body)
+	}
+}
+
+// TestNetworkInfoIsMinimalPublicJSON 覆盖 G10：网络信息接口无需 token，
+// 只返回 PeerId、公钥和完整 WebRTC Direct 地址，并设置 no-store；
+// 本机 listener、WSS 地址与运维字段都不能进入公开响应。
+func TestNetworkInfoIsMinimalPublicJSON(t *testing.T) {
+	info := &NetworkInfo{
+		PeerID:                      "peer-visible",
+		SupplierPublicKey:           "02" + strings.Repeat("ab", 32),
+		ListenAddresses:             []string{"/ip4/127.0.0.1/tcp/8080/ws"},
+		WebRTCDirectPublicAddresses: []string{"/ip4/0.0.0.0/udp/4001/webrtc-direct"},
+		WebRTCDirectAddresses:       []string{"/dns4/direct.example.com/udp/4001/webrtc-direct/certhash/cert-hash/p2p/peer-visible"},
+	}
+	// 生产装配在 listener 与运行时 certhash 都准备好后调用 SetRuntime；
+	// 测试也显式推进 ready，避免把“结构体已有字段”误当成“运行时已就绪”。
+	info.SetRuntime(info.ListenAddresses, info.WebRTCDirectPublicAddresses, info.WebRTCDirectAddresses)
+	handler := New(nil, &fakeCoordinator{}, Options{
+		AdminToken:  "secret-token",
+		NetworkInfo: info,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/network-info", nil)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("公开网络信息接口应 200，实际 %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("公开网络信息接口必须 no-store，实际 %q", got)
+	}
+	if got := recorder.Header().Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+		t.Fatalf("公开网络信息接口必须返回 JSON，实际 Content-Type=%q", got)
+	}
+
+	payload := decodeJSON(t, recorder.Body.String())
+	if len(payload) != 3 {
+		t.Fatalf("公开响应只能有 3 个字段，实际: %s", recorder.Body.String())
+	}
+	if payload["peer_id"] != "peer-visible" || payload["supplier_public_key"] != "02"+strings.Repeat("ab", 32) {
+		t.Fatalf("公开身份字段不正确: %s", recorder.Body.String())
+	}
+	addresses, ok := payload["webrtc_direct_addresses"].([]any)
+	if !ok || len(addresses) != 1 || addresses[0] != info.WebRTCDirectAddresses[0] {
+		t.Fatalf("公开 Direct 地址不正确: %s", recorder.Body.String())
+	}
+	for _, forbidden := range []string{"listen_addresses", "webrtc_direct_public_addresses", "admin_token", "tls", "wss"} {
+		if _, exists := payload[forbidden]; exists || strings.Contains(strings.ToLower(recorder.Body.String()), forbidden) {
+			t.Fatalf("公开响应不应包含 %q: %s", forbidden, recorder.Body.String())
+		}
+	}
+
+	methodReq := httptest.NewRequest(http.MethodPost, "/api/network-info", nil)
+	methodRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(methodRecorder, methodReq)
+	if methodRecorder.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("网络信息接口只允许 GET，POST 应 405，实际 %d", methodRecorder.Code)
+	}
+}
+
+// TestNetworkInfoIsUnavailableBeforeRuntimeSnapshot 覆盖启动竞态：
+// listener 已开始接收请求但 SetRuntime 尚未完成时，公开接口必须返回明确的 503，
+// 不能把尚未生成的 Direct 地址伪装成合法空数组；快照完成后再返回 200。
+func TestNetworkInfoIsUnavailableBeforeRuntimeSnapshot(t *testing.T) {
+	info := &NetworkInfo{
+		PeerID:            "peer-starting",
+		SupplierPublicKey: "02" + strings.Repeat("cd", 32),
+	}
+	handler := New(nil, &fakeCoordinator{}, Options{NetworkInfo: info})
+
+	request := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/api/network-info", nil)
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, req)
+		return recorder
+	}
+
+	before := request()
+	if before.Code != http.StatusServiceUnavailable {
+		t.Fatalf("运行时快照未完成时应返回 503，实际 %d: %s", before.Code, before.Body.String())
+	}
+	if before.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("未就绪响应也必须禁止缓存，实际 Cache-Control=%q", before.Header().Get("Cache-Control"))
+	}
+	if payload := decodeJSON(t, before.Body.String()); payload["error_code"] != "network_info_not_ready" {
+		t.Fatalf("未就绪错误码不正确: %s", before.Body.String())
+	}
+
+	// 并发请求与一次性快照发布交错：每个响应只能是“未就绪 503”或完整 200，
+	// 不允许观察到半填充的身份/地址快照。
+	const callers = 32
+	start := make(chan struct{})
+	results := make(chan *httptest.ResponseRecorder, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			results <- request()
+		}()
+	}
+	close(start)
+	info.SetRuntime(
+		[]string{"/ip4/127.0.0.1/tcp/8080/ws"},
+		[]string{"/ip4/203.0.113.10/udp/4001/webrtc-direct"},
+		[]string{"/ip4/203.0.113.10/udp/4001/webrtc-direct/certhash/cert-hash/p2p/peer-starting"},
+	)
+	wg.Wait()
+	close(results)
+	for recorder := range results {
+		if recorder.Code == http.StatusServiceUnavailable {
+			continue
+		}
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("并发启动请求只能得到 503/200，实际 %d: %s", recorder.Code, recorder.Body.String())
+		}
+		payload := decodeJSON(t, recorder.Body.String())
+		addresses, ok := payload["webrtc_direct_addresses"].([]any)
+		if !ok || len(addresses) != 1 || addresses[0] != "/ip4/203.0.113.10/udp/4001/webrtc-direct/certhash/cert-hash/p2p/peer-starting" {
+			t.Fatalf("200 响应必须包含完整运行时地址: %s", recorder.Body.String())
+		}
+	}
+
+	after := request()
+	if after.Code != http.StatusOK {
+		t.Fatalf("运行时快照完成后应返回 200，实际 %d: %s", after.Code, after.Body.String())
+	}
+}
+
+// TestEmptyAdminTokenDisablesProtectedAPI 明确 admin_token 为空的语义：
+// 公共内容/网络信息仍可访问，但受保护的 status 接口始终返回 401。
+func TestEmptyAdminTokenDisablesProtectedAPI(t *testing.T) {
+	a := newTestHandler(t)
+	handler := New(a.db, a.coord, Options{AdminToken: ""})
+	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("admin_token 为空时 /api/status 应始终 401，实际 %d: %s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -479,6 +613,7 @@ func TestMethodRestrictionsAndRemovedRoutes(t *testing.T) {
 	}{
 		{"删除文件必须被禁止", http.MethodDelete, "/api/files/" + testHashOne, http.StatusMethodNotAllowed},
 		{"POST 文件列表必须被禁止", http.MethodPost, "/api/files", http.StatusMethodNotAllowed},
+		{"POST 网络信息必须被禁止", http.MethodPost, "/api/network-info", http.StatusMethodNotAllowed},
 		{"PUT 状态接口必须被禁止", http.MethodPut, "/api/status", http.StatusMethodNotAllowed},
 		{"DELETE 扫描接口必须被禁止", http.MethodDelete, "/api/scans", http.StatusMethodNotAllowed},
 		{"clients CRUD 已删除应 404", http.MethodGet, "/api/clients", http.StatusNotFound},
@@ -501,7 +636,7 @@ func TestStaticPagesServed(t *testing.T) {
 	if status != http.StatusOK || !strings.Contains(body, "MSFile") {
 		t.Fatalf("首页应 200 且包含 MSFile 标识，实际 %d", status)
 	}
-	for _, asset := range []string{"/app.js", "/app.css"} {
+	for _, asset := range []string{"/app.js", "/network-address.mjs", "/app.css"} {
 		status, body = a.do(t, http.MethodGet, asset, "")
 		if status != http.StatusOK || body == "" {
 			t.Fatalf("%s 应 200 且非空，实际 %d", asset, status)
