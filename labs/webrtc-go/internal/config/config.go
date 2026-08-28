@@ -66,8 +66,8 @@ type Config struct {
 	HashWorkers        int      `yaml:"hash_workers"`         // 同时读取原文件并计算 Seed 的 worker 数，默认 1
 
 	ListenAddrs []string `yaml:"listen"`       // libp2p 监听 multiaddr 列表（webrtc-direct、ws、tls/ws）
-	AdminListen string   `yaml:"admin_listen"` // Web 管理台监听地址，默认只监听 loopback
-	AdminToken  string   `yaml:"admin_token"`  // Web 管理 API Bearer Token；非 loopback 监听时必填
+	AdminListen string   `yaml:"admin_listen"` // Web 公共内容服务监听地址，默认只监听 loopback
+	AdminToken  string   `yaml:"admin_token"`  // 兼容运维 API 的 Bearer Token；非 loopback 监听时必填
 
 	EnableFileWatcher *bool `yaml:"enable_file_watcher"` // 是否启用文件事件监视器；默认开启。关闭后仅靠周期全量扫描收敛（诊断与测试用途）
 

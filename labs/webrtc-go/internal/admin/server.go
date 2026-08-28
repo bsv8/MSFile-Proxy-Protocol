@@ -1,5 +1,6 @@
-// Package admin 提供 V1 Web 运维面：
-// 只读的平面 Hash 索引查询、同步状态展示和手动触发全量扫描。
+// Package admin 提供 V1 Web 内容服务：
+// 面向公共访问者展示可用的平面 Hash 索引，并提供文件详情与下载。
+// status/scans API 仍保留给已有运维脚本兼容使用，但不再出现在公共页面。
 //
 // 明确禁止（冻结需求 §11）：
 //
@@ -17,35 +18,38 @@ import (
 	"errors"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
+	"msfile.dev/labs/webrtc-go/internal/content"
 	"msfile.dev/labs/webrtc-go/internal/indexdb"
 )
 
 //go:embed web/*
 var webFiles embed.FS
 
-// Coordinator 是管理台需要的协调器只读能力（由 library.Coordinator 实现）。
+// Coordinator 是兼容运维 API 所需的协调器只读能力（由 library.Coordinator 实现）。
 type Coordinator interface {
 	QueueDepth() int       // 当前待处理路径队列深度
 	Scanning() bool        // 是否正在执行全量扫描
 	TriggerFullScan() bool // 请求触发一轮全量扫描；已有扫描进行中时返回 false
 }
 
-// Options 是管理台构造参数。
+// Options 是公共内容服务构造参数。
 type Options struct {
-	AdminToken    string        // Bearer Token；为空时仅限 loopback 使用（config 已校验）
-	PeerID        string        // 供应商 PeerId
-	PublicKey     string        // 供应商压缩公钥 hex
-	Addresses     []string      // 对外 MSFile multiaddr 列表
-	AccessMode    string        // private / public；只用于展示，不影响管理面认证
-	WhitelistSize int           // private 白名单条数；只展示数量，不返回公钥本身
-	Retention     time.Duration // invalid 派生数据保留期，用于剩余倒计时
+	Reader        *content.Reader // 内容读取器；公共下载从它打开安全文件副本
+	AdminToken    string          // 兼容运维 API 的 Bearer Token；公共内容 API 不需要
+	PeerID        string          // 供应商 PeerId
+	PublicKey     string          // 供应商压缩公钥 hex
+	Addresses     []string        // 对外 MSFile multiaddr 列表
+	AccessMode    string          // private / public；只用于兼容运维信息展示
+	WhitelistSize int             // private 白名单条数；只展示数量，不返回公钥本身
+	Retention     time.Duration   // invalid 派生数据保留期，用于兼容运维信息
 }
 
-// New 创建管理台 http.Handler。
+// New 创建公共内容服务 http.Handler。
 func New(db *indexdb.DB, coord Coordinator, options Options) http.Handler {
 	server := &Server{db: db, coord: coord, options: options}
 	mux := http.NewServeMux()
@@ -55,14 +59,18 @@ func New(db *indexdb.DB, coord Coordinator, options Options) http.Handler {
 	// 不会产生 ServeMux 模式冲突。
 	mux.Handle("/", securityHeaders(fileServer))
 
-	// 允许的 V1 API 最小集合；每个路径同时注册无方法兜底路由，
-	// 其他写方法一律返回中文 405，而不是默认纯文本响应。
+	// 公共内容 API 不要求管理令牌；它们只返回当前有效内容，并由下载处理器
+	// 在服务端通过 safefs.Root 打开原文件。兼容运维 API 仍单独受令牌保护。
+	mux.HandleFunc("GET /api/files", server.listFiles)
+	mux.HandleFunc("/api/files", server.methodNotAllowed)
+	mux.HandleFunc("GET /api/files/{seed_hash}", server.fileDetail)
+	mux.HandleFunc("/api/files/{seed_hash}", server.methodNotAllowed)
+	mux.HandleFunc("GET /api/files/{seed_hash}/download", server.download)
+	mux.HandleFunc("/api/files/{seed_hash}/download", server.methodNotAllowed)
+
+	// 兼容已有运维脚本的 API；公共页面不调用这些接口。
 	mux.HandleFunc("GET /api/status", server.protect(server.status))
 	mux.HandleFunc("/api/status", server.methodNotAllowed)
-	mux.HandleFunc("GET /api/files", server.protect(server.listFiles))
-	mux.HandleFunc("/api/files", server.methodNotAllowed)
-	mux.HandleFunc("GET /api/files/{seed_hash}", server.protect(server.fileDetail))
-	mux.HandleFunc("/api/files/{seed_hash}", server.methodNotAllowed)
 	mux.HandleFunc("GET /api/scans", server.protect(server.listScans))
 	mux.HandleFunc("POST /api/scans", server.protect(server.triggerScan))
 	mux.HandleFunc("/api/scans", server.methodNotAllowed)
@@ -70,7 +78,7 @@ func New(db *indexdb.DB, coord Coordinator, options Options) http.Handler {
 	return securityHeaders(mux)
 }
 
-// Server 持有管理台依赖。
+// Server 持有公共内容服务及兼容运维 API 的依赖。
 type Server struct {
 	db      *indexdb.DB
 	coord   Coordinator
@@ -105,7 +113,7 @@ func (s *Server) protect(next http.HandlerFunc) http.HandlerFunc {
 func (s *Server) methodNotAllowed(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Allow", s.allowHeader(r.URL.Path))
 	writeError(w, http.StatusMethodNotAllowed, "method_not_allowed",
-		"该路径不支持此 HTTP 方法；V1 管理台只提供只读查询与触发全量扫描")
+		"该路径不支持此 HTTP 方法；公共内容服务只提供 GET 下载与查询")
 }
 
 func (s *Server) allowHeader(path string) string {
@@ -119,7 +127,7 @@ func (s *Server) allowHeader(path string) string {
 
 func (s *Server) notFound(w http.ResponseWriter, r *http.Request) {
 	writeError(w, http.StatusNotFound, "not_found",
-		"接口不存在；V1 只有 status/files/scans 三组只读 API")
+		"接口不存在；公共页面只提供内容索引、详情和下载")
 }
 
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
@@ -155,15 +163,16 @@ func (s *Server) listFiles(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(query.Get("limit"))
 	offset, _ := strconv.Atoi(query.Get("offset"))
 	state := strings.TrimSpace(query.Get("state"))
-	if !isValidStateFilter(state) {
-		writeError(w, 400, "bad_state_filter", "状态过滤只能是 ready、invalid、indexing、error 或留空")
+	if state != "" && state != indexdb.StateReady {
+		writeError(w, 400, "bad_state_filter", "公共内容索引只展示有效文件，不支持其他状态筛选")
 		return
 	}
 	page, err := s.db.ListContents(r.Context(), indexdb.ListQuery{
-		Text:   strings.TrimSpace(query.Get("q")), // 匹配完整/前缀 Hash 或建议文件名
-		State:  state,
-		Limit:  limit,
-		Offset: offset,
+		Text:          strings.TrimSpace(query.Get("q")), // 匹配完整/前缀 Hash 或建议文件名
+		State:         indexdb.StateReady,
+		AvailableOnly: true, // 公共索引只展示 ready 且有 valid 文件副本的内容
+		Limit:         limit,
+		Offset:        offset,
 	}, s.options.Retention, time.Now())
 	if err != nil {
 		writeError(w, 500, "database_error", "查询平面 Hash 列表失败")
@@ -192,10 +201,126 @@ func (s *Server) fileDetail(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "database_error", "查询单 Hash 详情失败")
 		return
 	}
-	writeJSON(w, 200, map[string]any{
-		"content":   summary,   // 内容摘要（含可用副本数与保留倒计时）
-		"locations": locations, // 内部相对路径位置明细（非绝对路径）
-	})
+	if summary.State != indexdb.StateReady || summary.ValidReplicas == 0 {
+		writeError(w, http.StatusNotFound, "content_unavailable", "该文件当前不可用")
+		return
+	}
+	response := map[string]any{
+		"content":      summary,                               // 内容摘要（含可用副本数与保留倒计时）
+		"download_url": "/api/files/" + hashHex + "/download", // 浏览器下载地址
+	}
+	// 公共详情不暴露 nas_data 内部布局；带有效运维令牌的旧客户端仍可读取
+	// 原有的有效位置字段，保持兼容，不影响公共页面的最小信息面。
+	if s.hasAdminToken(r) {
+		response["locations"] = validLocations(locations)
+	}
+	writeJSON(w, 200, response)
+}
+
+func (s *Server) hasAdminToken(r *http.Request) bool {
+	if s.options.AdminToken == "" {
+		return false
+	}
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	return subtle.ConstantTimeCompare([]byte(token), []byte(s.options.AdminToken)) == 1
+}
+
+// validLocations 只保留当前有效位置，避免公共详情页展示失效诊断。
+// 旧客户端仍可读取 locations 字段；公共前端不会把内部路径渲染出来。
+func validLocations(locations []indexdb.LocationDetail) []indexdb.LocationDetail {
+	filtered := make([]indexdb.LocationDetail, 0, len(locations))
+	for _, location := range locations {
+		if location.State == indexdb.LocationValid {
+			filtered = append(filtered, location)
+		}
+	}
+	return filtered
+}
+
+// download 提供公共文件下载。文件名来自索引中的 recommended_filename，
+// 但文件内容只能由 content.Reader 从当前 valid 副本安全打开。
+func (s *Server) download(w http.ResponseWriter, r *http.Request) {
+	hashHex := strings.ToLower(strings.TrimSpace(r.PathValue("seed_hash")))
+	if _, err := hex.DecodeString(hashHex); err != nil || len(hashHex) != 64 {
+		writeError(w, http.StatusBadRequest, "invalid_seed_hash", "Seed Hash 必须是 64 位小写 hex")
+		return
+	}
+	if s.options.Reader == nil {
+		writeError(w, http.StatusServiceUnavailable, "download_unavailable", "下载服务尚未就绪")
+		return
+	}
+	file, info, err := s.options.Reader.OpenFileForDownload(r.Context(), hashHex)
+	if errors.Is(err, content.ErrContentNotFound) {
+		writeError(w, http.StatusNotFound, "content_not_found", "索引中没有该 Seed Hash")
+		return
+	}
+	if errors.Is(err, content.ErrUnavailable) {
+		writeError(w, http.StatusNotFound, "content_unavailable", "该文件当前不可用")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "download_failed", "打开下载文件失败")
+		return
+	}
+	defer file.Close()
+
+	fileInfo, err := file.Stat()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "download_failed", "读取下载文件信息失败")
+		return
+	}
+	filename := safeDownloadFilename(info.Filename)
+	if filename == "" {
+		filename = "download"
+	}
+	mediaType := info.MediaType
+	if mediaType == "" {
+		mediaType = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", mediaType)
+	w.Header().Set("Content-Disposition", contentDisposition(filename))
+	http.ServeContent(w, r, filename, fileInfo.ModTime(), file)
+}
+
+// safeDownloadFilename 防止异常索引数据污染 Content-Disposition。
+// 正常数据已由 seed.SafeFilename 收敛，这里再做一次 HTTP 层防护。
+func safeDownloadFilename(filename string) string {
+	filename = strings.TrimSpace(strings.ReplaceAll(filename, "\\", "/"))
+	if slash := strings.LastIndexByte(filename, '/'); slash >= 0 {
+		filename = filename[slash+1:]
+	}
+	filename = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || r == '"' {
+			return '_'
+		}
+		return r
+	}, filename)
+	if filename == "." || filename == ".." {
+		return ""
+	}
+	return filename
+}
+
+// contentDisposition 让 ASCII 文件名直接显示，同时为 UTF-8 文件名提供
+// RFC 5987 filename*，浏览器会优先使用 filename* 保存用户看到的原文件名。
+func contentDisposition(filename string) string {
+	if isASCIIHeaderFilename(filename) {
+		return `attachment; filename="` + filename + `"`
+	}
+	encoded := strings.ReplaceAll(url.QueryEscape(filename), "+", "%20")
+	return `attachment; filename="download"; filename*=UTF-8''` + encoded
+}
+
+func isASCIIHeaderFilename(filename string) bool {
+	if filename == "" {
+		return false
+	}
+	for i := 0; i < len(filename); i++ {
+		if filename[i] < 0x20 || filename[i] > 0x7e || filename[i] == '"' || filename[i] == '\\' {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) listScans(w http.ResponseWriter, r *http.Request) {
@@ -220,14 +345,6 @@ func (s *Server) triggerScan(w http.ResponseWriter, r *http.Request) {
 		"status":    "accepted",
 		"status_zh": "已接受，全量扫描开始执行",
 	})
-}
-
-func isValidStateFilter(state string) bool {
-	switch state {
-	case "", indexdb.StateReady, indexdb.StateInvalid, indexdb.StateIndexing, indexdb.StateError:
-		return true
-	}
-	return false
 }
 
 func clampLimit(limit int) int {

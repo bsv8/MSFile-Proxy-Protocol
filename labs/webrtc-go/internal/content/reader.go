@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 
 	"msfile.dev/labs/webrtc-go/internal/indexdb"
@@ -143,6 +144,55 @@ func (r *Reader) ReadSeed(ctx context.Context, seedHashHex string) ([]byte, erro
 		}
 	}
 	return data, nil
+}
+
+// OpenFileForDownload 打开一个当前可用内容的原文件副本。
+//
+// 只允许 ready 且至少有一个 valid 位置的内容；候选路径来自 SQLite，
+// 实际打开仍然必须经过 safefs.Root，避免下载接口绕过路径安全检查。
+// 返回的文件句柄由调用方负责关闭。
+func (r *Reader) OpenFileForDownload(ctx context.Context, seedHashHex string) (*os.File, StatInfo, error) {
+	seedHashHex = strings.ToLower(strings.TrimSpace(seedHashHex))
+	availability, err := r.db.GetAvailability(ctx, seedHashHex)
+	if errors.Is(err, indexdb.ErrNotFound) {
+		return nil, StatInfo{}, ErrContentNotFound
+	}
+	if err != nil {
+		return nil, StatInfo{}, err
+	}
+	if availability.Content.State != indexdb.StateReady || availability.ValidReplicas == 0 {
+		return nil, StatInfo{}, fmt.Errorf("%w：%s", ErrUnavailable, seedHashHex)
+	}
+
+	paths, err := r.db.ValidLocationPaths(ctx, seedHashHex)
+	if err != nil {
+		return nil, StatInfo{}, err
+	}
+	var lastErr error
+	for _, path := range paths {
+		file, info, openErr := r.root.OpenFile(path)
+		if openErr != nil {
+			lastErr = openErr
+			continue
+		}
+		// 索引尺寸与当前打开文件不一致时，拒绝下载这份可能已变化的内容。
+		if info.Size() != availability.Content.SizeBytes {
+			_ = file.Close()
+			lastErr = fmt.Errorf("文件尺寸已变化：索引 %d，当前 %d",
+				availability.Content.SizeBytes, info.Size())
+			continue
+		}
+		return file, StatInfo{
+			Filename:  availability.Content.RecommendedFilename,
+			SizeBytes: info.Size(),
+			MediaType: availability.Content.MediaType,
+		}, nil
+	}
+
+	if lastErr != nil {
+		return nil, StatInfo{}, fmt.Errorf("%w：有效副本无法读取：%v", ErrUnavailable, lastErr)
+	}
+	return nil, StatInfo{}, fmt.Errorf("%w：没有可读取副本", ErrUnavailable)
 }
 
 // ReadBlock 按块 Hash 从一个 valid 原文位置读取 exact 字节并校验 SHA-256。

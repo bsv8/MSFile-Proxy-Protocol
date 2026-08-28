@@ -96,7 +96,7 @@ type BlockLocation struct {
 	LengthBytes  int64  `json:"length_bytes"`  // 1..262144
 }
 
-// ContentSummary 是管理台列表行：contents 加上可用副本数。
+// ContentSummary 是内容索引列表行：contents 加上可用副本数。
 type ContentSummary struct {
 	Content
 	ValidReplicas   int        `json:"valid_replicas"`          // valid 状态的位置数量

@@ -16,7 +16,7 @@ msfile-nas --config /etc/msfile-nas.yaml --check-config  # 仅校验配置
 
 1. `/msfile/1.0.0`：运行在已认证 libp2p stream 上的 MSFile Proxy V1（Stat/Read）；
 2. WebRTC Direct、WS、WSS：libp2p transport；
-3. Web 运维台与只读 `/api/*`：平面 Hash 索引与同步状态展示 + 触发全量扫描。
+3. Web 公共内容索引：平面 Hash 索引、文件详情与按文件名下载。
 
 ### 两个数据区
 
@@ -93,21 +93,22 @@ MSFile 不复制上游身份协议，也不增加私有握手字段。`/msfile/1
 这是因为上游 V1 的不可提取身份 host 不承诺需要 `PrivKey.Raw()` 的 WebRTC 构造路径，
 不代表 MSFile 可以自行定义另一套公钥或 PeerId 规则。
 
-## 5. Web 运维台
+## 5. Web 公共内容索引
 
-默认监听 loopback。API 最小集合：
+默认监听 loopback。公共页面只使用以下接口，接口不要求 Bearer Token：
 
 ```text
-GET  /api/status             服务与扫描状态、队列深度、统计计数
-GET  /api/files              平面 Seed Hash 列表（支持前缀 Hash/文件名搜索、状态过滤）
-GET  /api/files/{seed_hash}  单 Hash 详情（内部相对路径位置明细，无绝对路径）
-GET  /api/scans              最近扫描记录
-POST /api/scans              触发一次全量扫描
+GET  /api/files                              当前有效内容列表（支持前缀 Hash/文件名搜索）
+GET  /api/files/{seed_hash}                  文件详情与下载地址
+GET  /api/files/{seed_hash}/download         按索引 filename 下载原文件
 ```
 
+列表只返回 `ready` 且至少有一个 `valid` 文件位置的内容；公共详情不暴露 NAS 内部路径。
 其余方法返回中文 `405`；不存在白名单 CRUD 或原文件写路由。
-非 loopback 监听必须配置 `admin_token`（Bearer）；`access_mode=public`
-不会改变管理面认证要求。
+
+为兼容已有脚本，`GET /api/status`、`GET /api/scans`、`POST /api/scans` 仍保留，
+但不出现在公共页面，且继续要求 `admin_token`（Bearer）。`access_mode=public`
+不会改变这些兼容运维接口的认证要求。
 
 ## 6. 一次性切换与回滚
 
@@ -130,7 +131,7 @@ msfile-nas --config /etc/msfile-nas.yaml --check-config
 # 查看日志事件（JSON，中文 reason_zh）
 journalctl -u msfile-nas -f | jq 'select(.event|test("scan|gc|watcher"))'
 
-# 手动触发全量扫描
+# 兼容运维接口：手动触发全量扫描（公共页面不提供此按钮）
 curl -s -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/scans
 
 # 从零重建索引（确认 nas_data 无需变更后）

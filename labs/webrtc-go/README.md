@@ -15,7 +15,7 @@ msfile-nas --config /etc/msfile-nas.yaml
   空白名单拒绝全部，没有 allow-all 回退；
 - 同步：fsnotify 文件事件快速发现 + 周期全量扫描最终收敛 + stat A/B/C 稳定性检测；
 - 存储：SQLite 单执行器串行队列；Seed staging+fsync+原子 rename 发布；
-- Web：中文平面 Hash 运维台，只读 API + 触发扫描，无目录树、无上传删除、无白名单管理。
+- Web：中文平面 Hash 公共内容索引，只展示当前有效文件，支持搜索、详情和按文件名下载；无目录树、无上传删除、无白名单管理。
 
 配置示例见 [config/msfile-nas.example.yaml](config/msfile-nas.example.yaml)（全字段中文注释）。
 

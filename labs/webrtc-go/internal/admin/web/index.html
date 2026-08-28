@@ -3,100 +3,119 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MSFile NAS 运维台</title>
+  <title>MSFile · 公共内容索引</title>
   <link rel="stylesheet" href="/app.css">
 </head>
 <body>
-  <header class="topbar">
-    <h1>MSFile NAS V1 运维台</h1>
-    <p class="subtitle">平面 Hash 索引视图 · 服务只读 nas_data，本页面没有任何原文件写操作</p>
-  </header>
+  <div class="page-shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="MSFile 公共内容索引首页">
+        <span class="brand-mark" aria-hidden="true">MS</span>
+        <span class="brand-name">MSFile</span>
+      </a>
+      <div class="service-label">
+        <span class="service-dot" aria-hidden="true"></span>
+        公共内容服务
+      </div>
+    </header>
 
-  <section class="cards" id="status-cards">
-    <div class="card"><span class="card-label">服务状态</span><span class="card-value" id="st-service">加载中…</span></div>
-    <div class="card"><span class="card-label">访问模式</span><span class="card-value" id="st-mode">-</span></div>
-    <div class="card"><span class="card-label">内容总数</span><span class="card-value" id="st-total">-</span></div>
-    <div class="card"><span class="card-label">可提供（ready）</span><span class="card-value ok" id="st-ready">-</span></div>
-    <div class="card"><span class="card-label">已失效（invalid）</span><span class="card-value warn" id="st-invalid">-</span></div>
-    <div class="card"><span class="card-label">索引中 / 错误</span><span class="card-value" id="st-busy">-</span></div>
-    <div class="card"><span class="card-label">有效位置 / 失效位置</span><span class="card-value" id="st-locations">-</span></div>
-    <div class="card"><span class="card-label">待处理队列</span><span class="card-value" id="st-queue">-</span></div>
-  </section>
+    <main>
+      <section class="hero" aria-labelledby="page-title">
+        <p class="eyebrow">PUBLIC CONTENT INDEX</p>
+        <h1 id="page-title">查找可用内容</h1>
+        <p class="hero-copy">按文件名或 Seed Hash 前缀检索已完成索引的文件，打开详情即可下载。</p>
+      </section>
 
-  <section class="panel">
-    <h2>全量扫描</h2>
-    <div class="scan-row">
-      <button id="btn-scan" type="button">立即触发一次全量扫描</button>
-      <span id="scan-state" class="scan-state"></span>
-    </div>
-    <table class="table" id="scan-table">
-      <thead>
-        <tr><th>批次号</th><th>开始时间</th><th>结束时间</th><th>状态</th><th>诊断信息（中文）</th></tr>
-      </thead>
-      <tbody></tbody>
-    </table>
-  </section>
+      <section class="index-section" aria-labelledby="index-title">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">CONTENT INDEX</p>
+            <h2 id="index-title">内容索引</h2>
+          </div>
+          <p class="result-count" id="result-count" aria-live="polite">加载中…</p>
+        </div>
 
-  <section class="panel">
-    <h2>内容索引（按 Seed Hash 平面排列，无目录树）</h2>
-    <form class="filters" id="filters" onsubmit="return false;">
-      <label>搜索：<input id="q" type="text" placeholder="完整或前缀 Seed Hash、建议文件名" autocomplete="off"></label>
-      <label>状态：
-        <select id="state">
-          <option value="">全部</option>
-          <option value="ready">可提供 ready</option>
-          <option value="invalid">已失效 invalid</option>
-          <option value="indexing">索引中 indexing</option>
-          <option value="error">错误 error</option>
-        </select>
-      </label>
-      <button id="btn-refresh" type="button">刷新列表</button>
-      <span class="hint">字段含义：状态表示内容可用性；「剩余保留」是全部位置失效后派生数据被回收前的倒计时。</span>
-    </form>
-    <table class="table" id="file-table">
-      <thead>
-        <tr>
-          <th>Seed Hash（内容唯一标识）</th>
-          <th>建议文件名</th>
-          <th>媒体类型</th>
-          <th>尺寸（字节）</th>
-          <th>可用副本数</th>
-          <th>状态</th>
-          <th>首次索引时间</th>
-          <th>最近更新时间</th>
-          <th>剩余保留时间</th>
-        </tr>
-      </thead>
-      <tbody></tbody>
-    </table>
-    <div class="pager">
-      <button id="btn-prev" type="button">上一页</button>
-      <span id="page-info"></span>
-      <button id="btn-next" type="button">下一页</button>
-    </div>
-  </section>
+        <form class="filters" id="filters">
+          <label class="search-box">
+            <span class="sr-only">搜索文件名或 Seed Hash</span>
+            <span class="search-icon" aria-hidden="true">⌕</span>
+            <input id="q" type="search" placeholder="搜索文件名或 Seed Hash 前缀" autocomplete="off">
+            <button class="search-submit" type="submit">搜索</button>
+          </label>
+          <button class="button button-secondary" id="btn-refresh" type="button">刷新列表</button>
+        </form>
 
-  <section class="panel" id="detail-panel" hidden>
-    <h2>单 Hash 详情：<span id="detail-hash"></span></h2>
-    <table class="table" id="location-table">
-      <thead>
-        <tr>
-          <th>内部相对路径（非绝对路径）</th>
-          <th>位置状态</th>
-          <th>尺寸（字节）</th>
-          <th>修改时间</th>
-          <th>失效起始时间</th>
-          <th>中文同步诊断</th>
-        </tr>
-      </thead>
-      <tbody></tbody>
-    </table>
-    <button id="btn-close-detail" type="button">关闭详情</button>
-  </section>
+        <div class="table-wrap">
+          <table class="table" id="file-table">
+            <thead>
+              <tr>
+                <th>Seed Hash（内容唯一标识）</th>
+                <th>文件名</th>
+                <th>类型</th>
+                <th>大小</th>
+                <th>状态</th>
+                <th><span class="sr-only">操作</span></th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
 
-  <footer class="footer">
-    <p>说明：白名单只在配置文件中管理，本页面不提供白名单操作；nas_data 原文件的增删改请通过用户挂载进行。</p>
-  </footer>
+        <div class="pager">
+          <button class="button button-secondary" id="btn-prev" type="button">上一页</button>
+          <span id="page-info" aria-live="polite"></span>
+          <button class="button button-secondary" id="btn-next" type="button">下一页</button>
+        </div>
+      </section>
+
+      <section class="detail-section" id="detail-panel" aria-labelledby="detail-title" hidden>
+        <div class="detail-topline">
+          <div>
+            <p class="section-kicker">FILE DETAIL</p>
+            <h2 id="detail-title">文件详情</h2>
+          </div>
+          <button class="button button-secondary" id="btn-close-detail" type="button">关闭</button>
+        </div>
+
+        <div class="detail-intro">
+          <div>
+            <p class="detail-label">文件名</p>
+            <h3 id="detail-filename">-</h3>
+            <code class="detail-hash" id="detail-hash" title="完整 Seed Hash"></code>
+          </div>
+          <a class="download-button" id="btn-download" href="#" download>
+            <span>下载文件</span>
+            <span class="download-arrow" aria-hidden="true">↓</span>
+          </a>
+        </div>
+
+        <dl class="metadata">
+          <div>
+            <dt>文件名</dt>
+            <dd id="detail-filename-meta">-</dd>
+          </div>
+          <div>
+            <dt>媒体类型</dt>
+            <dd id="detail-type">-</dd>
+          </div>
+          <div>
+            <dt>文件大小</dt>
+            <dd id="detail-size">-</dd>
+          </div>
+          <div>
+            <dt>状态</dt>
+            <dd><span class="state-ready" id="detail-state">有效，可下载</span></dd>
+          </div>
+        </dl>
+        <p class="detail-note">下载文件名由内容索引中的 filename 字段决定。</p>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>MSFile</span>
+      <span>内容按 Seed Hash 去重索引，当前仅展示可用文件。</span>
+    </footer>
+  </div>
 
   <script src="/app.js"></script>
 </body>

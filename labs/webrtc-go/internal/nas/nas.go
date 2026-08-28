@@ -9,7 +9,7 @@
 //	  -> 启动 coordinator（安排首次全量扫描）
 //	  -> 注册 /msfile/1.0.0
 //	  -> 启动 WebRTC Direct + WS/WSS listener
-//	  -> 启动 Web 管理面
+//	  -> 启动 Web 公共内容服务
 //
 // 本包只做装配与生命周期编排；SQL、扫描、Hash、协议编解码都在各自的 internal 包内。
 package nas
@@ -171,6 +171,7 @@ func New(cfg *config.Config) (*App, error) {
 	// 8. 注册正式 /msfile/1.0.0 文件服务（不注册实验协议；仅此一次）。
 	app.msfileS = msfile.NewServer(h, app.reader, policy, log) // 仅注册一次（阻断 5 清理项）
 	adminHandler := admin.New(db, coord, admin.Options{
+		Reader:        app.reader,
 		AdminToken:    cfg.AdminToken,
 		PeerID:        selfID.String(),
 		PublicKey:     pubHex,
@@ -181,7 +182,7 @@ func New(cfg *config.Config) (*App, error) {
 	})
 	adminListener, err := net.Listen("tcp", cfg.AdminListen)
 	if err != nil {
-		return fail(fmt.Errorf("Web 管理台监听 %s 失败: %w", cfg.AdminListen, err))
+		return fail(fmt.Errorf("Web 公共内容服务监听 %s 失败: %w", cfg.AdminListen, err))
 	}
 	app.adminLn = adminListener
 	app.adminSv = &http.Server{
@@ -203,7 +204,7 @@ func New(cfg *config.Config) (*App, error) {
 	for _, address := range ServiceMultiaddrs(h) {
 		fmt.Fprintf(os.Stderr, "NAS MSFile multiaddr（可复制）: %s\n", address)
 	}
-	fmt.Fprintf(os.Stderr, "Web 管理台: http://%s\n", cfg.AdminListen)
+	fmt.Fprintf(os.Stderr, "Web 公共内容索引: http://%s\n", cfg.AdminListen)
 	return app, nil
 }
 
@@ -227,7 +228,7 @@ func (a *App) Run(ctx context.Context) error {
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			// 管理 Serve 非预期退出：立即有界停止全部资源并把错误上抛。
 			a.shutdown(shutdownTimeout)
-			return fmt.Errorf("Web 管理服务异常退出: %w", err)
+			return fmt.Errorf("Web 公共内容服务异常退出: %w", err)
 		}
 	}
 	return a.shutdown(shutdownTimeout)
@@ -276,7 +277,7 @@ func (a *App) shutdown(timeout time.Duration) error {
 						_ = a.adminLn.Close()
 					}
 					<-serveDone
-					firstErr = errors.New("Web 管理台停止超时，已强制关闭监听")
+					firstErr = errors.New("Web 公共内容服务停止超时，已强制关闭监听")
 				}
 			}
 		}
@@ -327,7 +328,7 @@ func (a *App) release() {
 // Host 暴露 libp2p host 给测试做端到端连接；业务代码不应使用。
 func (a *App) Host() host.Host { return a.host }
 
-// Coordinator 暴露协调器给测试与管理扩展；业务代码不应使用。
+// Coordinator 暴露协调器给测试与运维扩展；业务代码不应使用。
 func (a *App) Coordinator() *library.Coordinator { return a.coord }
 
 // acquireServiceLock 用文件锁保证同一 seed_data 只有一个服务实例。

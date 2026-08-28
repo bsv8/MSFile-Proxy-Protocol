@@ -20,6 +20,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -28,7 +29,9 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"msfile.dev/labs/webrtc-go/internal/content"
 	"msfile.dev/labs/webrtc-go/internal/indexdb"
+	"msfile.dev/labs/webrtc-go/internal/safefs"
 )
 
 // fakeCoordinator 用原子变量模拟协调器的三个只读能力，
@@ -169,6 +172,55 @@ func newTestHandler(t *testing.T) *adminTest {
 	return &adminTest{handler: securityHeaders(mux), db: db, coord: coord, root: root}
 }
 
+// newDownloadTestHandler 搭建一个带真实原文件的公共内容服务，验证下载链路。
+func newDownloadTestHandler(t *testing.T) *adminTest {
+	t.Helper()
+	root := t.TempDir()
+	nasRoot := filepath.Join(root, "nas_data")
+	if err := os.MkdirAll(filepath.Join(nasRoot, "internal"), 0o750); err != nil {
+		t.Fatalf("创建测试 nas_data 失败: %v", err)
+	}
+	const relativePath = "internal/original.txt"
+	const fileName = "public-name.txt"
+	const fileBody = "MSFile public download\n"
+	if err := os.WriteFile(filepath.Join(nasRoot, filepath.FromSlash(relativePath)), []byte(fileBody), 0o640); err != nil {
+		t.Fatalf("写入测试原文件失败: %v", err)
+	}
+
+	dbPath := filepath.Join(root, "index.sqlite")
+	db, err := indexdb.Open(dbPath)
+	if err != nil {
+		t.Fatalf("打开索引数据库失败: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("打开测试直连失败: %v", err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	if _, err := raw.ExecContext(context.Background(), `PRAGMA busy_timeout = 5000`); err != nil {
+		t.Fatalf("设置 busy_timeout 失败: %v", err)
+	}
+	insertSeedRow(t, raw, testHashOne, relativePath, fileName, "text/plain", int64(len(fileBody)), time.Now())
+	_ = raw.Close()
+
+	safeRoot, err := safefs.Open(nasRoot)
+	if err != nil {
+		t.Fatalf("打开安全文件根失败: %v", err)
+	}
+	t.Cleanup(func() { _ = safeRoot.Close() })
+	reader := content.New(safeRoot, db, nil, nil)
+	coord := &fakeCoordinator{}
+	options := testOptions
+	options.Reader = reader
+	return &adminTest{
+		handler: New(db, coord, options),
+		db:      db,
+		coord:   coord,
+		root:    root,
+	}
+}
+
 // do 直接对 handler 发起一次请求（不经网络），返回状态码与响应体文本。
 func (a *adminTest) do(t *testing.T, method, target, token string) (int, string) {
 	t.Helper()
@@ -179,6 +231,18 @@ func (a *adminTest) do(t *testing.T, method, target, token string) (int, string)
 	recorder := httptest.NewRecorder()
 	a.handler.ServeHTTP(recorder, request)
 	return recorder.Code, recorder.Body.String()
+}
+
+// doWithHeaders 与 do 相同，但额外返回响应头，供下载接口验收使用。
+func (a *adminTest) doWithHeaders(t *testing.T, method, target, token string) (int, http.Header, string) {
+	t.Helper()
+	request := httptest.NewRequest(method, target, nil)
+	if token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+	recorder := httptest.NewRecorder()
+	a.handler.ServeHTTP(recorder, request)
+	return recorder.Code, recorder.Header(), recorder.Body.String()
 }
 
 // decodeJSON 把响应体解析成通用 map，失败即致命。
@@ -324,6 +388,57 @@ func TestFileDetailReturnsLocationsAndValidatesHash(t *testing.T) {
 	// 长度 64 但非 hex 字符 → 400。
 	if status, _ = a.do(t, http.MethodGet, "/api/files/"+strings.Repeat("zz", 32), "test-token"); status != http.StatusBadRequest {
 		t.Fatalf("非 hex Hash 应 400，实际 %d", status)
+	}
+}
+
+// TestPublicContentListAndDownload 验证公共页面所用接口：
+// 无 Bearer Token 也能查询可用内容，详情不暴露内部路径，下载使用索引文件名。
+func TestPublicContentListAndDownload(t *testing.T) {
+	a := newDownloadTestHandler(t)
+
+	status, body := a.do(t, http.MethodGet, "/api/files", "")
+	if status != http.StatusOK {
+		t.Fatalf("公共内容列表应 200，实际 %d: %s", status, body)
+	}
+	if !strings.Contains(body, `"total":1`) || !strings.Contains(body, "public-name.txt") {
+		t.Fatalf("公共内容列表缺少可用文件: %s", body)
+	}
+	if strings.Contains(body, "internal/original.txt") {
+		t.Fatal("公共内容列表不应泄露内部路径")
+	}
+
+	status, body = a.do(t, http.MethodGet, "/api/files/"+testHashOne, "")
+	if status != http.StatusOK {
+		t.Fatalf("公共文件详情应 200，实际 %d: %s", status, body)
+	}
+	if !strings.Contains(body, "/download") || strings.Contains(body, "relative_path") {
+		t.Fatalf("公共详情应提供下载地址且不暴露位置字段: %s", body)
+	}
+
+	status, headers, body := a.doWithHeaders(t, http.MethodGet,
+		"/api/files/"+testHashOne+"/download", "")
+	if status != http.StatusOK || body != "MSFile public download\n" {
+		t.Fatalf("下载内容不正确，状态=%d body=%q", status, body)
+	}
+	if got := headers.Get("Content-Disposition"); got != `attachment; filename="public-name.txt"` {
+		t.Fatalf("下载文件名应使用索引 filename，实际 %q", got)
+	}
+}
+
+// TestPublicContentListExcludesUnavailable 验证公共索引不返回非 ready 内容。
+func TestPublicContentListExcludesUnavailable(t *testing.T) {
+	a := newTestHandler(t)
+	if err := a.db.MarkContentError(context.Background(), testHashTwo, "测试：内容不可用", time.Now()); err != nil {
+		t.Fatalf("标记测试内容失效失败: %v", err)
+	}
+
+	status, body := a.do(t, http.MethodGet, "/api/files", "test-token")
+	if status != http.StatusOK {
+		t.Fatalf("公共内容列表应 200，实际 %d: %s", status, body)
+	}
+	payload := decodeJSON(t, body)
+	if payload["total"] != float64(1) || strings.Contains(body, testHashTwo) {
+		t.Fatalf("非有效内容不应出现在公共列表: %s", body)
 	}
 }
 

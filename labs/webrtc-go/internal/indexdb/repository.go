@@ -687,14 +687,15 @@ func (d *DB) BlockCandidates(ctx context.Context, blockHash string, limit int) (
 	})
 }
 
-// ---------- 管理台查询 ----------
+// ---------- 公共内容索引查询 ----------
 
-// ListQuery 是管理台列表过滤条件。
+// ListQuery 是内容索引列表过滤条件。
 type ListQuery struct {
-	Text   string // 匹配完整/前缀 Hash 或建议文件名
-	State  string // 空 = 全部
-	Limit  int
-	Offset int
+	Text          string // 匹配完整/前缀 Hash 或建议文件名
+	State         string // 空 = 全部
+	AvailableOnly bool   // 只返回至少有一个 valid 文件位置的 ready 内容
+	Limit         int
+	Offset        int
 }
 
 // ContentPage 是一次列表查询结果：行加总数。
@@ -718,6 +719,13 @@ func (d *DB) ListContents(ctx context.Context, q ListQuery, retention time.Durat
 		if q.State != "" {
 			where += ` AND c.state = ?`
 			args = append(args, q.State)
+		}
+		if q.AvailableOnly {
+			where += ` AND c.state = ?
+				AND EXISTS (SELECT 1 FROM file_locations f_available
+				            WHERE f_available.seed_hash = c.seed_hash
+				              AND f_available.state = 'valid')`
+			args = append(args, StateReady)
 		}
 		var total int64
 		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM contents c `+where, args...).Scan(&total); err != nil {
@@ -760,6 +768,30 @@ func (d *DB) ListContents(ctx context.Context, q ListQuery, retention time.Durat
 			return ContentPage{}, err
 		}
 		return ContentPage{Items: items, Total: total}, nil
+	})
+}
+
+// ValidLocationPaths 返回某个内容当前全部 valid 文件位置的内部相对路径。
+// 仅供公共下载在服务端选择副本使用，绝不直接写入 HTTP 响应。
+func (d *DB) ValidLocationPaths(ctx context.Context, seedHash string) ([]string, error) {
+	return call(ctx, d.exec, func(ctx context.Context, db *sql.DB) ([]string, error) {
+		rows, err := db.QueryContext(ctx,
+			`SELECT relative_path FROM file_locations
+			 WHERE seed_hash = ? AND state = 'valid'
+			 ORDER BY relative_path`, seedHash)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		paths := make([]string, 0, 2)
+		for rows.Next() {
+			var path string
+			if err := rows.Scan(&path); err != nil {
+				return nil, err
+			}
+			paths = append(paths, path)
+		}
+		return paths, rows.Err()
 	})
 }
 

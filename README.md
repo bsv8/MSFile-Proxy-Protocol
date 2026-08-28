@@ -34,7 +34,7 @@ JSON、Base64 或十六进制包装。
   `public` 放行任意已认证 secp256k1 客户端并实施全局资源限额；
 - **传输**：libp2p WebRTC Direct + WS/WSS 承载正式 `/msfile/1.0.0`；
 - **存储**：SQLite 由单个异步执行器独占（MaxOpenConns=1），业务代码无法绕过；
-- **Web**：中文平面 Hash 运维台，只有只读查询与触发扫描，没有上传/删除/白名单管理。
+- **Web**：中文平面 Hash 公共内容索引，只展示当前有效文件并支持按文件名/Hash 搜索、详情查看与按文件名下载；不提供原文件写操作。
 
 配置示例（全字段中文注释）：[labs/webrtc-go/config/msfile-nas.example.yaml](./labs/webrtc-go/config/msfile-nas.example.yaml)。
 构建、启动、切换与回滚见 [Go NAS 服务运行手册](./docs/nas-service.zh.md)。
