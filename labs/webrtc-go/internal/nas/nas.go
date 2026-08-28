@@ -33,6 +33,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
+	yamux "github.com/libp2p/go-libp2p/p2p/muxer/yamux"
+	noise "github.com/libp2p/go-libp2p/p2p/security/noise"
 	webrtc "github.com/libp2p/go-libp2p/p2p/transport/webrtc"
 	websocket "github.com/libp2p/go-libp2p/p2p/transport/websocket"
 	ma "github.com/multiformats/go-multiaddr"
@@ -383,6 +385,10 @@ func buildHost(priv crypto.PrivKey, cfg *config.Config) (host.Host, error) {
 	h, err := libp2p.New(
 		libp2p.Identity(priv),
 		libp2p.ListenAddrs(maddrs...),
+		// MSFile Network V1 明确冻结为 Noise + Yamux。这里必须显式装配，
+		// 避免 go-libp2p 默认值未来变化或同时开放 libp2p TLS 等额外协商面。
+		libp2p.Security(noise.ID, noise.New),
+		libp2p.Muxer(yamux.ID, yamux.DefaultTransport),
 		libp2p.Transport(webrtc.New),
 		libp2p.Transport(websocket.New, wsOptions...),
 		libp2p.ResourceManager(resourceMgr),
