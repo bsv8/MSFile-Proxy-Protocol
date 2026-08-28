@@ -316,6 +316,7 @@ func (s *Server) fileDetail(w http.ResponseWriter, r *http.Request) {
 	}
 	response := map[string]any{
 		"content":      summary,                               // 内容摘要（含可用副本数与保留倒计时）
+		"filenames":    validFilenames(locations),             // 当前有效副本的去重文件名；不含 nas_data 内部路径
 		"download_url": "/api/files/" + hashHex + "/download", // 浏览器下载地址
 	}
 	// 公共详情不暴露 nas_data 内部布局；带有效运维令牌的旧客户端仍可读取
@@ -344,6 +345,29 @@ func validLocations(locations []indexdb.LocationDetail) []indexdb.LocationDetail
 		}
 	}
 	return filtered
+}
+
+// validFilenames 返回单个 Seed Hash 当前有效副本对应的文件名集合。
+// 这里只公开 basename（不含目录的文件名），不公开 nas_data 内部相对路径；列表仍只使用
+// Content.RecommendedFilename 这一条推荐文件名。
+func validFilenames(locations []indexdb.LocationDetail) []string {
+	filenames := make([]string, 0, len(locations))
+	seen := make(map[string]struct{}, len(locations))
+	for _, location := range locations {
+		if location.State != indexdb.LocationValid {
+			continue
+		}
+		filename := safeDownloadFilename(location.RelativePath)
+		if filename == "" {
+			continue
+		}
+		if _, exists := seen[filename]; exists {
+			continue
+		}
+		seen[filename] = struct{}{}
+		filenames = append(filenames, filename)
+	}
+	return filenames
 }
 
 // download 提供公共文件下载。文件名来自索引中的 recommended_filename，

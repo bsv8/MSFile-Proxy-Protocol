@@ -219,15 +219,6 @@ function appendCell(row, value, className) {
   return cell;
 }
 
-function appendStatusCell(row) {
-  var cell = document.createElement("td");
-  var state = document.createElement("span");
-  state.className = "state-ready";
-  state.textContent = "有效";
-  cell.appendChild(state);
-  row.appendChild(cell);
-}
-
 function appendDetailCell(row, seedHash) {
   var cell = document.createElement("td");
   var button = document.createElement("button");
@@ -249,7 +240,7 @@ function renderFiles(data) {
     var emptyRow = document.createElement("tr");
     var emptyCell = document.createElement("td");
     emptyCell.className = "empty-state";
-    emptyCell.colSpan = 6;
+    emptyCell.colSpan = 5;
     emptyCell.textContent = $("q").value.trim() ? "没有找到匹配的可用内容" : "暂无可用内容";
     emptyRow.appendChild(emptyCell);
     tbody.appendChild(emptyRow);
@@ -275,7 +266,6 @@ function renderFiles(data) {
     appendCell(row, item.recommended_filename, "filename-cell");
     appendCell(row, item.media_type, "type-cell");
     appendCell(row, fmtBytes(item.size_bytes), "size-cell");
-    appendStatusCell(row);
     appendDetailCell(row, seedHash);
     tbody.appendChild(row);
   });
@@ -300,13 +290,31 @@ function openDetail(seedHash) {
     var content = data.content || {};
     var fullHash = content.seed_hash || seedHash;
     var filename = content.recommended_filename || "download";
-    $("detail-filename").textContent = filename;
-    $("detail-filename-meta").textContent = filename;
-    $("detail-hash").textContent = shortHash(fullHash);
+    $("detail-hash").textContent = fullHash;
     $("detail-hash").title = "完整 Seed Hash：" + fullHash;
+
+    var filenames = Array.isArray(data.filenames) ? data.filenames : [];
+    // 兼容旧服务端：升级前的详情响应只有推荐文件名，仍保证页面有文件名可看。
+    if (filenames.length === 0 && content.recommended_filename) {
+      filenames = [content.recommended_filename];
+    }
+    var filenameList = $("detail-filenames");
+    filenameList.textContent = "";
+    if (filenames.length === 0) {
+      var emptyFilename = document.createElement("li");
+      emptyFilename.className = "detail-filenames-empty";
+      emptyFilename.textContent = "暂无关联文件名";
+      filenameList.appendChild(emptyFilename);
+    } else {
+      filenames.forEach(function (name) {
+        var filenameItem = document.createElement("li");
+        filenameItem.textContent = String(name);
+        filenameList.appendChild(filenameItem);
+      });
+    }
+
     $("detail-type").textContent = content.media_type || "application/octet-stream";
     $("detail-size").textContent = fmtBytes(content.size_bytes);
-    $("detail-state").textContent = "有效，可下载";
 
     var download = $("btn-download");
     download.href = data.download_url || ("/api/files/" + encodeURIComponent(fullHash) + "/download");

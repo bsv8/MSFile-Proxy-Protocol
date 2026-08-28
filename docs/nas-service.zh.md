@@ -196,6 +196,11 @@ loopback HTTP 开发页 -> /ip4|ip6|dns4/<当前主机>/tcp/<端口>/ws/p2p/<pee
 列表只返回 `ready` 且至少有一个 `valid` 文件位置的内容；公共详情不暴露 NAS 内部路径。
 其余方法返回中文 `405`；不存在白名单 CRUD 或原文件写路由。
 
+`GET /api/files/{seed_hash}` 的详情响应中，`content.seed_hash` 始终是完整的 64 位小写
+hex Seed Hash（内容唯一标识）；`filenames` 是该 Hash 当前有效副本对应的去重文件名列表，
+只公开 basename（不含目录的文件名），不公开 `nas_data` 内部路径。列表 `GET /api/files` 仍只返回一个
+`recommended_filename`（推荐文件名），下载也使用这个推荐文件名。
+
 为兼容已有脚本，`GET /api/status`、`GET /api/scans`、`POST /api/scans` 仍保留，
 但不出现在公共页面，且继续要求 `admin_token`（Bearer）。`admin_token` 为空时表示运维 API
 禁用，受保护接口始终返回 401；`access_mode=public`

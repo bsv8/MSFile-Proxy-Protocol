@@ -116,6 +116,27 @@ func insertSeedRow(t *testing.T, raw *sql.DB, seedHash, relativePath, filename, 
 	}
 }
 
+// insertValidLocation 只追加一个有效位置，用于验证同一 Seed Hash 对应多个文件名。
+// 位置路径可以包含目录，但详情公开字段只能提取并返回 basename。
+func insertValidLocation(t *testing.T, root, seedHash, relativePath string) {
+	t.Helper()
+	raw, err := sql.Open("sqlite", filepath.Join(root, "index.sqlite"))
+	if err != nil {
+		t.Fatalf("打开追加位置的测试数据库失败: %v", err)
+	}
+	defer raw.Close()
+	if _, err := raw.ExecContext(context.Background(), `PRAGMA busy_timeout = 5000`); err != nil {
+		t.Fatalf("设置追加位置的 busy_timeout 失败: %v", err)
+	}
+	if _, err := raw.ExecContext(context.Background(),
+		`INSERT INTO file_locations(relative_path, seed_hash, size_bytes, mtime_ns, device_id, inode,
+		    state, invalid_since, last_seen_generation, revision, last_error_zh)
+		 VALUES (?, ?, 1, ?, NULL, NULL, 'valid', NULL, 0, 1, '')`,
+		relativePath, seedHash, time.Now().UnixNano()); err != nil {
+		t.Fatalf("追加有效文件位置失败: %v", err)
+	}
+}
+
 // newTestHandler 搭建带两条已索引内容的管理台测试环境。
 // 路由部分逐行复刻 server.go 中 New 的注册表，静态根采用无方法模式；
 // 其余语义（公共内容、管理 API 认证、方法兜底 405、/api/ 兜底 404）保持一致。
@@ -507,6 +528,10 @@ func TestFileDetailReturnsLocationsAndValidatesHash(t *testing.T) {
 	if location["relative_path"] != "电影/one.mkv" {
 		t.Fatalf("locations 内应是内部相对路径: %s", body)
 	}
+	filenames, ok := payload["filenames"].([]any)
+	if !ok || len(filenames) != 1 || filenames[0] != "one.mkv" {
+		t.Fatalf("详情应返回当前有效副本的文件名: %s", body)
+	}
 	if strings.Contains(body, a.root) {
 		t.Fatal("详情响应泄漏了绝对路径")
 	}
@@ -556,6 +581,65 @@ func TestPublicContentListAndDownload(t *testing.T) {
 	}
 	if got := headers.Get("Content-Disposition"); got != `attachment; filename="public-name.txt"` {
 		t.Fatalf("下载文件名应使用索引 filename，实际 %q", got)
+	}
+}
+
+// TestPublicFileDetailReturnsAllFilenames 验证同一 Seed Hash 的公共详情会展示
+// 全部不同文件名，而公共列表仍只展示 contents.recommended_filename 一条推荐文件名。
+func TestPublicFileDetailReturnsAllFilenames(t *testing.T) {
+	a := newTestHandler(t)
+	insertValidLocation(t, a.root, testHashOne, "备份/one-copy.mkv")
+
+	status, body := a.do(t, http.MethodGet, "/api/files", "")
+	if status != http.StatusOK {
+		t.Fatalf("公共内容列表应 200，实际 %d: %s", status, body)
+	}
+	listPayload := decodeJSON(t, body)
+	items, ok := listPayload["items"].([]any)
+	if !ok || len(items) != 2 {
+		t.Fatalf("列表应仍按 Seed Hash 返回两条内容: %s", body)
+	}
+	var firstItem map[string]any
+	for _, item := range items {
+		candidate, candidateOK := item.(map[string]any)
+		if candidateOK && candidate["seed_hash"] == testHashOne {
+			firstItem = candidate
+			break
+		}
+	}
+	if firstItem == nil || firstItem["recommended_filename"] != "one.mkv" {
+		t.Fatalf("列表应只展示该 Hash 的推荐文件名: %s", body)
+	}
+	if strings.Contains(body, "one-copy.mkv") {
+		t.Fatal("公共列表不应展开同一 Hash 的全部文件名")
+	}
+
+	status, body = a.do(t, http.MethodGet, "/api/files/"+testHashOne, "")
+	if status != http.StatusOK {
+		t.Fatalf("公共文件详情应 200，实际 %d: %s", status, body)
+	}
+	payload := decodeJSON(t, body)
+	content, ok := payload["content"].(map[string]any)
+	if !ok || content["seed_hash"] != testHashOne {
+		t.Fatalf("公共详情应返回完整 Seed Hash: %s", body)
+	}
+	filenames, ok := payload["filenames"].([]any)
+	if !ok || len(filenames) != 2 {
+		t.Fatalf("公共详情应返回两个文件名: %s", body)
+	}
+	seen := map[string]bool{}
+	for _, value := range filenames {
+		name, nameOK := value.(string)
+		if !nameOK {
+			t.Fatalf("filenames 必须全部是字符串: %s", body)
+		}
+		seen[name] = true
+	}
+	if !seen["one.mkv"] || !seen["one-copy.mkv"] {
+		t.Fatalf("公共详情文件名不完整: %s", body)
+	}
+	if strings.Contains(body, "备份/") || strings.Contains(body, "电影/") || strings.Contains(body, a.root) {
+		t.Fatal("公共详情只能公开 basename，不应泄露内部路径")
 	}
 }
 

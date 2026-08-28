@@ -119,7 +119,6 @@
                 <th>文件名</th>
                 <th>类型</th>
                 <th>大小</th>
-                <th>状态</th>
                 <th><span class="sr-only">操作</span></th>
               </tr>
             </thead>
@@ -144,10 +143,13 @@
         </div>
 
         <div class="detail-intro">
-          <div>
-            <p class="detail-label">文件名</p>
-            <h3 id="detail-filename">-</h3>
-            <code class="detail-hash" id="detail-hash" title="完整 Seed Hash"></code>
+          <div class="detail-primary">
+            <p class="detail-label">Seed Hash · 内容唯一标识</p>
+            <code class="detail-hash" id="detail-hash" title="完整 Seed Hash">-</code>
+            <div class="detail-filenames-block">
+              <p class="detail-label">关联文件名（当前有效副本）</p>
+              <ul class="detail-filenames" id="detail-filenames"></ul>
+            </div>
           </div>
           <a class="download-button" id="btn-download" href="#" download>
             <span>下载文件</span>
@@ -157,10 +159,6 @@
 
         <dl class="metadata">
           <div>
-            <dt>文件名</dt>
-            <dd id="detail-filename-meta">-</dd>
-          </div>
-          <div>
             <dt>媒体类型</dt>
             <dd id="detail-type">-</dd>
           </div>
@@ -168,12 +166,8 @@
             <dt>文件大小</dt>
             <dd id="detail-size">-</dd>
           </div>
-          <div>
-            <dt>状态</dt>
-            <dd><span class="state-ready" id="detail-state">有效，可下载</span></dd>
-          </div>
         </dl>
-        <p class="detail-note">下载文件名由内容索引中的 filename 字段决定。</p>
+        <p class="detail-note">同一个 Seed Hash 可以对应多个文件名；下载时使用内容索引中的推荐文件名。</p>
       </section>
     </main>
 
