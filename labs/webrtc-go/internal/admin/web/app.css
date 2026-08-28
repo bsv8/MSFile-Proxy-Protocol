@@ -508,7 +508,7 @@ button { border: 0; }
   display: block;
   max-width: 100%;
   color: var(--ink);
-  font-size: clamp(17px, 2.2vw, 26px);
+  font-size: clamp(16px, 2vw, 24px);
   font-weight: 700;
   line-height: 1.4;
   letter-spacing: 0.02em;
