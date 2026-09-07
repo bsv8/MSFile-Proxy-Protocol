@@ -57,9 +57,13 @@ export function currentBrowserNetworkAddress(locationLike, peerID) {
 export function validateNetworkPayload(data) {
   var peerID = String(data && data.peer_id || "").trim();
   var publicKey = String(data && data.supplier_public_key || "").trim();
+  var contentIndexEnabled = data && data.content_index_enabled;
   if (!peerID) throw new Error("服务端未返回 NAS PeerId");
   if (!/^0[23][0-9a-fA-F]{64}$/.test(publicKey)) {
     throw new Error("服务端未返回合法的 33 字节压缩公钥");
+  }
+  if (typeof contentIndexEnabled !== "boolean") {
+    throw new Error("服务端未返回 Web 内容索引权限标志");
   }
 
   var values = data && data.webrtc_direct_addresses;
@@ -74,7 +78,12 @@ export function validateNetworkPayload(data) {
     }
     direct.push({ value: value, hostname: normalizeHostname(match[2]) });
   });
-  return { peerID: peerID, publicKey: publicKey, direct: direct };
+  return {
+    peerID: peerID,
+    publicKey: publicKey,
+    direct: direct,
+    contentIndexEnabled: contentIndexEnabled
+  };
 }
 
 // hasSameHostname 判断 WSS 页面 hostname 与 Direct 公布地址是否相同。

@@ -46,6 +46,7 @@ type Limits struct {
 	MaxInflightRequests    int           // 全局在途请求 goroutine 硬上限（含 Stat）
 	MaxInflightPerConn     int           // 单 connection 在途请求上限
 	ReadQueueTimeout       time.Duration // 等待读取槽位的最长时间；超时返回 rate_limited
+	ReadDelay              time.Duration // 读取内容前的可取消延迟；仅测试/故障注入使用，0 = 不延迟
 	RequestReadTimeout     time.Duration // 单个请求 Frame 的读取 deadline（防半包挂死）
 	GlobalWriteBytesPerSec int64         // 全局响应带宽上限（字节/秒）；0 = 不限
 	ConnWriteBytesPerSec   int64         // 单 connection 响应带宽上限（字节/秒）；0 = 不限
@@ -134,6 +135,7 @@ type Server struct {
 	readSem      chan struct{}
 	inflight     atomic.Int32
 	globalBucket *rateBucket
+	readMetrics  readMetrics
 
 	connMu sync.Mutex
 	conns  map[string]*connState
@@ -151,6 +153,49 @@ type response struct {
 type pendingRead struct {
 	id    uint64
 	stage atomic.Int32 // 0=进行中 1=已承诺发送终态 3=已被覆盖取消
+}
+
+// ReadMetricsSnapshot 是 supplier Read 的运行时计数快照，供受保护的管理面和 E2E 读取。
+// started/completed/aborted 是互斥终态：每个已接受 Read 最终只计入 completed 或 aborted。
+// cancelled 是其中因同 Hash 新请求覆盖而 abort 的子集。
+type ReadMetricsSnapshot struct {
+	Started   uint64 `json:"started"`   // 已接受的 Read 请求数
+	Completed uint64 `json:"completed"` // 已完成并提交终态响应的 Read 数
+	Cancelled uint64 `json:"cancelled"` // 被同 Hash 新请求覆盖的 Read 数
+	Aborted   uint64 `json:"aborted"`   // 在终态响应前被取消的 Read 数
+}
+
+type readMetrics struct {
+	started   atomic.Uint64
+	completed atomic.Uint64
+	cancelled atomic.Uint64
+	aborted   atomic.Uint64
+}
+
+// ReadMetrics 返回当前 supplier Read 计数；只返回数值，不包含 Hash、请求内容或身份信息。
+func (s *Server) ReadMetrics() ReadMetricsSnapshot {
+	return ReadMetricsSnapshot{
+		Started:   s.readMetrics.started.Load(),
+		Completed: s.readMetrics.completed.Load(),
+		Cancelled: s.readMetrics.cancelled.Load(),
+		Aborted:   s.readMetrics.aborted.Load(),
+	}
+}
+
+func (s *Server) completeRead(pending *pendingRead) bool {
+	if !pending.stage.CompareAndSwap(0, 1) {
+		return false
+	}
+	s.readMetrics.completed.Add(1)
+	return true
+}
+
+func (s *Server) abortRead(pending *pendingRead) bool {
+	if !pending.stage.CompareAndSwap(0, 3) {
+		return false
+	}
+	s.readMetrics.aborted.Add(1)
+	return true
 }
 
 // NewServer 创建服务端并注册 /msfile/1.0.0 handler；同时挂接连接断开清理。
@@ -308,13 +353,15 @@ func (s *Server) handleStream(stream network.Stream) {
 			return true
 		}
 		hash := hex.EncodeToString(request.Hash[:])
+		s.readMetrics.started.Add(1)
 		current := &pendingRead{id: request.ID}
 		pendingMu.Lock()
 		previous := pending[hash]
 		pending[hash] = current
-		cancelled := previous != nil && previous.stage.CompareAndSwap(0, 3)
+		cancelled := previous != nil && s.abortRead(previous)
 		pendingMu.Unlock()
 		if cancelled {
+			s.readMetrics.cancelled.Add(1)
 			responses <- response{fields: ReadCancelled(previous.id, request.Hash, request.ID)}
 		}
 		workers.Add(1)
@@ -333,6 +380,7 @@ func (s *Server) handleStream(stream network.Stream) {
 	}
 
 	keepReading := handle(first)
+	inputEndedNormally := false
 	for keepReading {
 		_ = stream.SetReadDeadline(time.Now().Add(s.limits.RequestReadTimeout))
 		request, readErr := ReadRequest(reader)
@@ -341,12 +389,23 @@ func (s *Server) handleStream(stream network.Stream) {
 			// 必须经 Once 释放：直接调用会与上方 defer 构成二次释放——
 			// 旧 handler 收尾时会把新 stream 刚取得的角色错误清掉（阻断 1）。
 			releaseRoleOnce()
+			// 客户端发送完请求后 CloseWrite() 会让服务端读到 io.EOF，
+			// 这只是输入方向正常结束，不能取消已经接受的 worker；否则
+			// 合法的半关闭请求会被错误变成 internal_error。真正的 Reset、
+			// 超时或协议错误仍保持“先 cancel，再等待 worker”语义。
+			inputEndedNormally = errors.Is(readErr, io.EOF)
 			break
 		}
 		keepReading = handle(request)
 	}
+	// 异常断流一旦发生，先取消所有在途 Read，再等待 worker 收尾；不能反过来
+	// `workers.Wait()` 后才 cancel，否则客户端断开时 Read 会继续占用资源直到
+	// 内容读取完成，supplier 端也无法形成可观察的 Abort。正常 CloseWrite()
+	// 则让已接受请求完整发送响应。
+	if !inputEndedNormally {
+		cancel()
+	}
 	workers.Wait()
-	cancel()
 	close(responses)
 	if werr := <-writerDone; werr != nil {
 		_ = stream.Reset()
@@ -389,39 +448,70 @@ func (s *Server) handleRead(request Request, pending *pendingRead, out chan<- re
 	case s.readSem <- struct{}{}:
 		defer func() { <-s.readSem }()
 	case <-time.After(s.limits.ReadQueueTimeout):
-		if pending.stage.CompareAndSwap(0, 1) {
+		if s.completeRead(pending) {
 			send(queueCtx, out, response{fields: Error(request.Kind, request.ID, "rate_limited", "服务繁忙，请稍后重试", retryAfterMs()), done: done})
 		} else {
+			s.abortRead(pending)
 			done()
 		}
 		return
 	case <-queueCtx.Done():
+		s.abortRead(pending)
 		done()
 		return
 	}
 	if queueCtx.Err() != nil {
+		s.abortRead(pending)
 		done()
 		return
 	}
+	if s.limits.ReadDelay > 0 {
+		timer := time.NewTimer(s.limits.ReadDelay)
+		select {
+		case <-timer.C:
+		case <-queueCtx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			s.abortRead(pending)
+			done()
+			return
+		}
+	}
 	data, err := s.reader.Resolve(queueCtx, hex.EncodeToString(request.Hash[:]))
 	if err != nil {
-		if pending.stage.CompareAndSwap(0, 1) {
+		if queueCtx.Err() != nil {
+			s.abortRead(pending)
+			done()
+			return
+		}
+		if s.completeRead(pending) {
 			code, message := readErrorCode(err)
 			send(queueCtx, out, response{fields: Error(request.Kind, request.ID, code, message, 0), done: done})
 		} else {
+			s.abortRead(pending)
 			done()
 		}
 		return
 	}
 	if int64(len(data)) > MaxContentBytes {
-		if pending.stage.CompareAndSwap(0, 1) {
+		if s.completeRead(pending) {
 			send(queueCtx, out, response{fields: Error(request.Kind, request.ID, "integrity_error", "内容尺寸超过协议上限", 0), done: done})
 		} else {
+			s.abortRead(pending)
 			done()
 		}
 		return
 	}
-	if !pending.stage.CompareAndSwap(0, 1) {
+	if queueCtx.Err() != nil {
+		s.abortRead(pending)
+		done()
+		return
+	}
+	if !s.completeRead(pending) {
 		done()
 		return
 	}

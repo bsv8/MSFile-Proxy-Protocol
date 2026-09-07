@@ -191,6 +191,18 @@ func New(cfg *config.Config) (*App, error) {
 		AccessMode:                  cfg.AccessMode,
 		WhitelistSize:               len(cfg.PublicKeyWhitelist),
 		Retention:                   cfg.InvalidRetention.Standard(),
+		ReadMetrics: func() map[string]uint64 {
+			if app.msfileS == nil {
+				return map[string]uint64{}
+			}
+			readMetrics := app.msfileS.ReadMetrics()
+			return map[string]uint64{
+				"started":   readMetrics.Started,
+				"completed": readMetrics.Completed,
+				"cancelled": readMetrics.Cancelled,
+				"aborted":   readMetrics.Aborted,
+			}
+		},
 	})
 
 	h, err := buildHost(priv, cfg, adminHandler)
@@ -202,7 +214,9 @@ func New(cfg *config.Config) (*App, error) {
 
 	// 8. 注册正式 /msfile/1.0.0 文件服务（不注册实验协议；仅此一次）。
 	// 此时 host 尚未 Listen，因此不会出现“已可连接但协议 handler 尚未注册”的窗口。
-	app.msfileS = msfile.NewServer(h, app.reader, policy, log) // 仅注册一次（阻断 5 清理项）
+	msfileLimits := msfile.DefaultLimits()
+	msfileLimits.ReadDelay = cfg.ReadDelay.Standard()
+	app.msfileS = msfile.NewServerWithLimits(h, app.reader, policy, log, msfileLimits) // 仅注册一次（阻断 5 清理项）
 	// 9. 由 libp2p transport 建立唯一共享入口：普通 HTTP 由 fallback handler
 	// 处理，HTTP/1.1 WebSocket Upgrade 由 libp2p WebSocket transport 处理。
 	if err := listenHost(h, cfg); err != nil {
@@ -223,7 +237,11 @@ func New(cfg *config.Config) (*App, error) {
 		"access_mode":    cfg.AccessMode,
 	})
 	fmt.Fprintf(os.Stderr, "NAS PeerId: %s\n", selfID.String())
-	fmt.Fprintln(os.Stderr, "Web 公共内容索引: 由共享 Web/WS 入口提供（地址请在页面“网络接入地址”区域查看）")
+	if cfg.AccessMode == config.AccessModePublic {
+		fmt.Fprintln(os.Stderr, "Web 公共内容索引: 由共享 Web/WS 入口提供（地址请在页面“网络接入地址”区域查看）")
+	} else {
+		fmt.Fprintln(os.Stderr, "Web 内容索引: public_key_whitelist 白名单模式已关闭")
+	}
 	return app, nil
 }
 

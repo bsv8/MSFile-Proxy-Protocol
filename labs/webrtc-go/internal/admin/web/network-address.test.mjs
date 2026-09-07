@@ -48,6 +48,7 @@ test("G14: Direct 与当前页面 hostname 相同则返回提示所需结果", (
   const network = validateNetworkPayload({
     peer_id: peerID,
     supplier_public_key: publicKey,
+    content_index_enabled: true,
     webrtc_direct_addresses: [
       "/dns4/nas.example.com/udp/4001/webrtc-direct/certhash/cert-hash/p2p/" + peerID,
       "/ip4/203.0.113.10/udp/4002/webrtc-direct/certhash/cert-hash/p2p/" + peerID

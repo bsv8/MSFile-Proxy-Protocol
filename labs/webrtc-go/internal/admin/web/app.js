@@ -1,5 +1,5 @@
-// MSFile 公共内容索引前端。
-// 公共页面只查询当前可用内容；详情页通过服务端提供的地址下载原文件。
+// MSFile Web 前端。
+// 仅在服务端明确开放 public 内容索引时查询文件；详情页通过服务端提供的地址下载原文件。
 import {
   currentBrowserNetworkAddress,
   hasSameHostname,
@@ -145,6 +145,10 @@ function renderDirectAddress(item, index) {
 function renderNetwork(data) {
   var network = validateNetworkPayload(data);
   clearNetworkError();
+  $("content-hero").hidden = !network.contentIndexEnabled;
+  $("content-index").hidden = !network.contentIndexEnabled;
+  if (!network.contentIndexEnabled) $("detail-panel").hidden = true;
+  if (network.contentIndexEnabled) loadFiles();
   $("network-peer-id").textContent = network.peerID;
   $("network-public-key").textContent = network.publicKey;
 
@@ -355,4 +359,3 @@ $("btn-close-detail").addEventListener("click", function () {
 
 document.querySelectorAll(".copy-button").forEach(bindCopyButton);
 loadNetworkInfo();
-loadFiles();

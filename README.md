@@ -37,7 +37,7 @@ JSON、Base64 或十六进制包装。
 - **公网地址**：`webrtc_direct_public_addresses` 只配置公网 UDP 基础地址，服务运行时补齐
   `certhash` 与 PeerId；不配置 WSS 公网地址字段；
 - **存储**：SQLite 由单个异步执行器独占（MaxOpenConns=1），业务代码无法绕过；
-- **Web**：中文平面 Hash 公共内容索引，只展示当前有效文件并支持按文件名/Hash 搜索、详情查看与按文件名下载；不提供原文件写操作。
+- **Web**：仅 `access_mode: public` 开放中文平面 Hash 公共内容索引，支持按文件名/Hash 搜索、详情查看与按文件名下载；`private`/`public_key_whitelist` 白名单模式隐藏并拒绝这些 Web 内容接口；不提供原文件写操作。
 
 配置示例（全字段中文注释）：[labs/webrtc-go/config/msfile-nas.example.yaml](./labs/webrtc-go/config/msfile-nas.example.yaml)。
 构建、启动、切换与回滚见 [Go NAS 服务运行手册](./docs/nas-service.zh.md)。

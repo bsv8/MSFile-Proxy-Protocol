@@ -49,6 +49,9 @@ file_stable_interval: 3s
 # 超过保留期才清理索引和无引用的派生 Seed（绝不触碰 nas_data 原文件）。
 invalid_retention: 24h
 
+# 仅测试/故障注入：MSFile Read 返回前的可取消延迟；正常部署不要配置。
+# read_delay: 750ms
+
 # 同时读取原文件并计算 Seed 的 worker 数量（1..32）。
 # 默认保守为 1，防止机械硬盘或低端 NAS 被并发读取打满。
 hash_workers: 1
@@ -95,12 +98,13 @@ listen:
 #tls_key_file: "/etc/msfile-nas/tls.key"
 
 # ───────────────────────── Web 公共内容索引 ─────────────────────────
+# 仅 access_mode: public 提供 Web 文件列表、详情和下载；private 白名单模式自动关闭。
 
 # 已弃用的旧版 host:port 字段：保留只是为了让旧 YAML 可加载，不创建 listener，
 # 也不参与端口或安全校验。实际绑定和 Web/API 入口只由 listen 决定；新配置可删除。
 #admin_listen: "127.0.0.1:4002"
 
 # 兼容运维 API（/api/status、/api/scans）的 Bearer Token；共享入口为非 loopback 时必填。
-# 为空表示运维 API 禁用（始终返回 401）；公共内容索引、详情和下载不需要此 token。
+# 为空表示运维 API 禁用（始终返回 401）；仅 access_mode: public 时提供公共内容索引、详情和下载，且不需要此 token。
 # token 不是 MSFile 客户端凭据。
 admin_token: "请替换为足够长的随机字符串"

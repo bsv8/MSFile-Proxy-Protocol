@@ -16,7 +16,8 @@ msfile-nas --config /etc/msfile-nas.yaml --check-config  # 仅校验配置
 
 1. `/msfile/1.0.0`：运行在已认证 libp2p stream 上的 MSFile Proxy V1（Stat/Read）；
 2. WebRTC Direct、WS、WSS：libp2p transport；WS/WSS 与普通 Web 共用同一个 TCP 入口；
-3. Web 公共内容索引：平面 Hash 索引、文件详情与按文件名下载。
+3. Web 公共内容索引：仅在 `access_mode: public` 时提供平面 Hash 索引、文件详情与按文件名下载。
+   `access_mode: private`（`public_key_whitelist` 白名单模式）不开放这些 Web 内容能力。
 
 ### 两个数据区
 
@@ -168,20 +169,24 @@ Cloudflare 使用 Full (Strict) 时，源站证书必须合法、未过期且覆
 
 ### 5.3 公共页面与 API
 
-公共页面不需要 Bearer Token，展示“网络接入地址”与内容索引。`GET /api/network-info` 是
-拨号方需要的最小公开接口，响应字段如下：
+公共页面不需要 Bearer Token，展示“网络接入地址”。只有 `access_mode: public` 才展示“内容索引”，
+并开放文件列表、详情和下载。`GET /api/network-info` 是拨号方需要的最小公开接口，响应字段如下：
 
 | 字段 | 中文含义 |
 |---|---|
 | `peer_id` | NAS 业务私钥派生的 libp2p PeerId |
 | `supplier_public_key` | NAS 的 33 字节压缩 secp256k1 公钥 hex |
 | `webrtc_direct_addresses` | 已补齐 `certhash` 和 PeerId 的公网 WebRTC Direct multiaddr |
+| `content_index_enabled` | Web 内容索引权限；仅 `access_mode: public` 为 `true`，白名单模式为 `false` |
 
 该接口只允许 `GET`、不要求 token，响应使用 JSON、安全响应 Header 和 `Cache-Control: no-store`。
 listener 已开始接收请求但运行时 `certhash`/PeerId 地址快照尚未完成时，返回 `503` 和中文错误码
 `network_info_not_ready`；页面会短暂退避后重试，不把空地址列表当作“已就绪”。
 它不会返回 WSS multiaddr、本机 `listen_addresses`、私钥、白名单、admin token、数据路径或
-Cloudflare 凭据。WSS 地址由页面使用当前浏览器的 `window.location.hostname` 与有效端口生成：
+Cloudflare 凭据。`content_index_enabled=false` 时，页面隐藏整个内容索引模块，
+`GET /api/files`、`GET /api/files/{seed_hash}` 和下载接口统一返回 `403 content_index_disabled`；
+这不影响已认证 MSFile 客户端按公钥白名单执行 Stat/Read。WSS 地址由页面使用当前浏览器的
+`window.location.hostname` 与有效端口生成：
 
 ```text
 HTTPS 页面 -> /ip4|ip6|dns4/<当前域名>/tcp/<端口>/tls/ws/p2p/<peer_id>
@@ -193,7 +198,8 @@ loopback HTTP 开发页 -> /ip4|ip6|dns4/<当前主机>/tcp/<端口>/ws/p2p/<pee
 即使使用相同 hostname，也分别是 TCP/TLS 和公网 UDP 两条独立路径；普通 Cloudflare 橙云
 记录通常不能把 UDP 直接导向 NAS。
 
-列表只返回 `ready` 且至少有一个 `valid` 文件位置的内容；公共详情不暴露 NAS 内部路径。
+在 `access_mode: public` 下，列表只返回 `ready` 且至少有一个 `valid` 文件位置的内容；公共详情不暴露
+NAS 内部路径。白名单模式不提供这些接口。
 其余方法返回中文 `405`；不存在白名单 CRUD 或原文件写路由。
 
 `GET /api/files/{seed_hash}` 的详情响应中，`content.seed_hash` 始终是完整的 64 位小写
@@ -237,7 +243,7 @@ journalctl -u msfile-nas -f | jq 'select(.event|test("scan|gc|watcher"))'
 # 共享 Web/WS 入口上的兼容运维接口：手动触发全量扫描（公共页面不提供此按钮）
 curl -s -X POST -H "Authorization: Bearer $TOKEN" https://nas.example.com/api/scans
 
-# 公开网络信息（不带 token；只返回 PeerId、公钥和已补齐的 WebRTC Direct 地址）
+# 公开网络信息（不带 token；返回 PeerId、公钥、已补齐的 WebRTC Direct 地址和内容索引权限）
 curl -s https://nas.example.com/api/network-info | jq
 
 # 读取受保护状态（实际地址以 listen 中的共享入口为准）

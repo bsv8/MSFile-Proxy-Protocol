@@ -66,6 +66,7 @@ type Config struct {
 	FileStableInterval Duration `yaml:"file_stable_interval"` // 文件安静多久才开始计算，默认 3s
 	InvalidRetention   Duration `yaml:"invalid_retention"`    // 文件不可见后的派生数据保留时间，默认 24h
 	HashWorkers        int      `yaml:"hash_workers"`         // 同时读取原文件并计算 Seed 的 worker 数，默认 1
+	ReadDelay          Duration `yaml:"read_delay"`           // 每个 MSFile Read 返回前的可取消延迟；仅测试/故障注入使用，默认 0
 
 	ListenAddrs                 []string `yaml:"listen"`                         // NAS 进程在本机真正绑定的 transport 地址（WebRTC Direct、WS、WSS）
 	WebRTCDirectPublicAddresses []string `yaml:"webrtc_direct_public_addresses"` // 对外公布的 WebRTC Direct 公网 UDP 基础地址；运行时补齐 certhash/PeerId
@@ -203,6 +204,9 @@ func (c *Config) Validate() error {
 	}
 	if c.InvalidRetention <= 0 {
 		return errors.New("配置错误：invalid_retention 必须大于 0")
+	}
+	if c.ReadDelay < 0 || c.ReadDelay > Duration(30*time.Second) {
+		return errors.New("配置错误：read_delay 必须在 0..30s 之间")
 	}
 	if c.HashWorkers < MinHashWorkers || c.HashWorkers > MaxHashWorkers {
 		return fmt.Errorf("配置错误：hash_workers 必须在 %d..%d 之间", MinHashWorkers, MaxHashWorkers)

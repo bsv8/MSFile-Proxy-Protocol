@@ -27,6 +27,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"msfile.dev/labs/webrtc-go/internal/config"
 	"msfile.dev/labs/webrtc-go/internal/content"
 	"msfile.dev/labs/webrtc-go/internal/indexdb"
 	"msfile.dev/labs/webrtc-go/internal/safefs"
@@ -141,6 +142,15 @@ func insertValidLocation(t *testing.T, root, seedHash, relativePath string) {
 // 路由部分逐行复刻 server.go 中 New 的注册表，静态根采用无方法模式；
 // 其余语义（公共内容、管理 API 认证、方法兜底 405、/api/ 兜底 404）保持一致。
 func newTestHandler(t *testing.T) *adminTest {
+	return newTestHandlerWithMode(t, testOptions.AccessMode)
+}
+
+// newPublicTestHandler 搭建显式 public 模式的测试环境，允许验证 Web 内容接口。
+func newPublicTestHandler(t *testing.T) *adminTest {
+	return newTestHandlerWithMode(t, config.AccessModePublic)
+}
+
+func newTestHandlerWithMode(t *testing.T, accessMode string) *adminTest {
 	t.Helper()
 	root := t.TempDir()
 	dbPath := filepath.Join(root, "index.sqlite")
@@ -163,7 +173,9 @@ func newTestHandler(t *testing.T) *adminTest {
 	insertSeedRow(t, raw, testHashTwo, "剧集/two.mp4", "two.mp4", "video/mp4", 7654321, now)
 
 	coord := &fakeCoordinator{}
-	server := &Server{db: db, coord: coord, options: testOptions}
+	options := testOptions
+	options.AccessMode = accessMode
+	server := &Server{db: db, coord: coord, options: options}
 
 	mux := http.NewServeMux()
 	assets, _ := fs.Sub(webFiles, "web")
@@ -177,6 +189,8 @@ func newTestHandler(t *testing.T) *adminTest {
 	mux.HandleFunc("/api/files", server.methodNotAllowed)
 	mux.HandleFunc("GET /api/files/{seed_hash}", server.fileDetail)
 	mux.HandleFunc("/api/files/{seed_hash}", server.methodNotAllowed)
+	mux.HandleFunc("GET /api/files/{seed_hash}/download", server.download)
+	mux.HandleFunc("/api/files/{seed_hash}/download", server.methodNotAllowed)
 	mux.HandleFunc("GET /api/network-info", server.networkInfo)
 	mux.HandleFunc("/api/network-info", server.methodNotAllowed)
 	mux.HandleFunc("GET /api/scans", server.protect(server.listScans))
@@ -227,6 +241,7 @@ func newDownloadTestHandler(t *testing.T) *adminTest {
 	reader := content.New(safeRoot, db, nil, nil)
 	coord := &fakeCoordinator{}
 	options := testOptions
+	options.AccessMode = config.AccessModePublic
 	options.Reader = reader
 	return &adminTest{
 		handler: New(db, coord, options),
@@ -333,7 +348,7 @@ func TestStatusRequiresBearerTokenAndReportsConfig(t *testing.T) {
 }
 
 // TestNetworkInfoIsMinimalPublicJSON 覆盖 G10：网络信息接口无需 token，
-// 只返回 PeerId、公钥和完整 WebRTC Direct 地址，并设置 no-store；
+// 只返回 PeerId、公钥、完整 WebRTC Direct 地址和内容索引权限，并设置 no-store；
 // 本机 listener、WSS 地址与运维字段都不能进入公开响应。
 func TestNetworkInfoIsMinimalPublicJSON(t *testing.T) {
 	info := &NetworkInfo{
@@ -349,6 +364,7 @@ func TestNetworkInfoIsMinimalPublicJSON(t *testing.T) {
 	handler := New(nil, &fakeCoordinator{}, Options{
 		AdminToken:  "secret-token",
 		NetworkInfo: info,
+		AccessMode:  config.AccessModePublic,
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/api/network-info", nil)
@@ -365,11 +381,14 @@ func TestNetworkInfoIsMinimalPublicJSON(t *testing.T) {
 	}
 
 	payload := decodeJSON(t, recorder.Body.String())
-	if len(payload) != 3 {
-		t.Fatalf("公开响应只能有 3 个字段，实际: %s", recorder.Body.String())
+	if len(payload) != 4 {
+		t.Fatalf("公开响应只能有 4 个字段，实际: %s", recorder.Body.String())
 	}
 	if payload["peer_id"] != "peer-visible" || payload["supplier_public_key"] != "02"+strings.Repeat("ab", 32) {
 		t.Fatalf("公开身份字段不正确: %s", recorder.Body.String())
+	}
+	if payload["content_index_enabled"] != true {
+		t.Fatalf("public 模式必须开放 Web 内容索引: %s", recorder.Body.String())
 	}
 	addresses, ok := payload["webrtc_direct_addresses"].([]any)
 	if !ok || len(addresses) != 1 || addresses[0] != info.WebRTCDirectAddresses[0] {
@@ -459,6 +478,40 @@ func TestNetworkInfoIsUnavailableBeforeRuntimeSnapshot(t *testing.T) {
 	}
 }
 
+// TestPrivateWhitelistModeDisablesWebContent 验证 private/public_key_whitelist 模式：
+// Web 仍可提供网络接入信息，但不允许通过 HTTP 查询列表、详情或下载，
+// 即使携带 admin_token 也不能绕过该内容公开策略。
+func TestPrivateWhitelistModeDisablesWebContent(t *testing.T) {
+	a := newTestHandler(t)
+
+	status, body := a.do(t, http.MethodGet, "/api/network-info", "")
+	if status != http.StatusOK {
+		t.Fatalf("白名单模式网络信息接口应 200，实际 %d: %s", status, body)
+	}
+	if payload := decodeJSON(t, body); payload["content_index_enabled"] != false {
+		t.Fatalf("白名单模式必须关闭 Web 内容索引标志: %s", body)
+	}
+
+	for _, target := range []string{
+		"/api/files",
+		"/api/files/" + testHashOne,
+		"/api/files/" + testHashOne + "/download",
+	} {
+		status, body = a.do(t, http.MethodGet, target, "")
+		if status != http.StatusForbidden {
+			t.Fatalf("白名单模式 %s 应 403，实际 %d: %s", target, status, body)
+		}
+		if payload := decodeJSON(t, body); payload["error_code"] != "content_index_disabled" {
+			t.Fatalf("白名单模式错误码不正确: %s", body)
+		}
+
+		status, _ = a.do(t, http.MethodGet, target, "test-token")
+		if status != http.StatusForbidden {
+			t.Fatalf("携带 admin_token 时白名单模式 %s 仍应 403，实际 %d", target, status)
+		}
+	}
+}
+
 // TestEmptyAdminTokenDisablesProtectedAPI 明确 admin_token 为空的语义：
 // 公共内容/网络信息仍可访问，但受保护的 status 接口始终返回 401。
 func TestEmptyAdminTokenDisablesProtectedAPI(t *testing.T) {
@@ -475,7 +528,7 @@ func TestEmptyAdminTokenDisablesProtectedAPI(t *testing.T) {
 // TestListFilesFiltersAndNeverLeaksAbsolutePaths 覆盖列表查询的
 // q 前缀 + state 过滤，以及响应体绝不包含任何绝对路径。
 func TestListFilesFiltersAndNeverLeaksAbsolutePaths(t *testing.T) {
-	a := newTestHandler(t)
+	a := newPublicTestHandler(t)
 
 	status, body := a.do(t, http.MethodGet, "/api/files?q="+testHashOne[:10]+"&state=ready", "test-token")
 	if status != http.StatusOK {
@@ -509,7 +562,7 @@ func TestListFilesFiltersAndNeverLeaksAbsolutePaths(t *testing.T) {
 // TestFileDetailReturnsLocationsAndValidatesHash 覆盖单 Hash 详情：
 // 200 时含 content 与 locations（相对路径）；未知 Hash 404；非法 Hash 格式 400。
 func TestFileDetailReturnsLocationsAndValidatesHash(t *testing.T) {
-	a := newTestHandler(t)
+	a := newPublicTestHandler(t)
 
 	status, body := a.do(t, http.MethodGet, "/api/files/"+testHashOne, "test-token")
 	if status != http.StatusOK {
@@ -587,7 +640,7 @@ func TestPublicContentListAndDownload(t *testing.T) {
 // TestPublicFileDetailReturnsAllFilenames 验证同一 Seed Hash 的公共详情会展示
 // 全部不同文件名，而公共列表仍只展示 contents.recommended_filename 一条推荐文件名。
 func TestPublicFileDetailReturnsAllFilenames(t *testing.T) {
-	a := newTestHandler(t)
+	a := newPublicTestHandler(t)
 	insertValidLocation(t, a.root, testHashOne, "备份/one-copy.mkv")
 
 	status, body := a.do(t, http.MethodGet, "/api/files", "")
@@ -645,7 +698,7 @@ func TestPublicFileDetailReturnsAllFilenames(t *testing.T) {
 
 // TestPublicContentListExcludesUnavailable 验证公共索引不返回非 ready 内容。
 func TestPublicContentListExcludesUnavailable(t *testing.T) {
-	a := newTestHandler(t)
+	a := newPublicTestHandler(t)
 	if err := a.db.MarkContentError(context.Background(), testHashTwo, "测试：内容不可用", time.Now()); err != nil {
 		t.Fatalf("标记测试内容失效失败: %v", err)
 	}
@@ -720,6 +773,11 @@ func TestStaticPagesServed(t *testing.T) {
 	if status != http.StatusOK || !strings.Contains(body, "MSFile") {
 		t.Fatalf("首页应 200 且包含 MSFile 标识，实际 %d", status)
 	}
+	if !strings.Contains(body, `id="content-hero"`) || !strings.Contains(body, `id="content-index"`) ||
+		!strings.Contains(body, `aria-labelledby="page-title" hidden`) ||
+		!strings.Contains(body, `aria-labelledby="index-title" hidden`) {
+		t.Fatal("页面应默认隐藏内容相关模块，待 public 模式确认后再由前端显示")
+	}
 	for _, asset := range []string{"/app.js", "/network-address.mjs", "/app.css"} {
 		status, body = a.do(t, http.MethodGet, asset, "")
 		if status != http.StatusOK || body == "" {
@@ -730,7 +788,7 @@ func TestStaticPagesServed(t *testing.T) {
 
 // TestListFilesRejectsIllegalStateFilter 验证 state=hacked 这类非法过滤值返回 400。
 func TestListFilesRejectsIllegalStateFilter(t *testing.T) {
-	a := newTestHandler(t)
+	a := newPublicTestHandler(t)
 	status, body := a.do(t, http.MethodGet, "/api/files?state=hacked", "test-token")
 	if status != http.StatusBadRequest {
 		t.Fatalf("非法 state 过滤值应 400，实际 %d", status)

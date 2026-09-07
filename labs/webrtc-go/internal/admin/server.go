@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"msfile.dev/labs/webrtc-go/internal/config"
 	"msfile.dev/labs/webrtc-go/internal/content"
 	"msfile.dev/labs/webrtc-go/internal/indexdb"
 )
@@ -93,17 +94,18 @@ func (n *NetworkInfo) snapshot() networkSnapshot {
 
 // Options 是公共内容服务构造参数。
 type Options struct {
-	Reader                      *content.Reader // 内容读取器；公共下载从它打开安全文件副本
-	AdminToken                  string          // 兼容运维 API 的 Bearer Token；公共内容 API 不需要
-	PeerID                      string          // 供应商 PeerId
-	PublicKey                   string          // 供应商压缩公钥 hex
-	Addresses                   []string        // 兼容旧调用方的本机 listener 地址；/api/status 使用
-	WebRTCDirectPublicAddresses []string        // 兼容旧调用方的 YAML WebRTC Direct 公网基础地址
-	WebRTCDirectAddresses       []string        // 兼容旧调用方的完整 WebRTC Direct 公网地址
-	NetworkInfo                 *NetworkInfo    // 运行时网络信息；用于在 host 监听后填充地址
-	AccessMode                  string          // private / public；只用于兼容运维信息展示
-	WhitelistSize               int             // private 白名单条数；只展示数量，不返回公钥本身
-	Retention                   time.Duration   // invalid 派生数据保留期，用于兼容运维信息
+	Reader                      *content.Reader          // 内容读取器；公共下载从它打开安全文件副本
+	AdminToken                  string                   // 兼容运维 API 的 Bearer Token；公共内容 API 不需要
+	PeerID                      string                   // 供应商 PeerId
+	PublicKey                   string                   // 供应商压缩公钥 hex
+	Addresses                   []string                 // 兼容旧调用方的本机 listener 地址；/api/status 使用
+	WebRTCDirectPublicAddresses []string                 // 兼容旧调用方的 YAML WebRTC Direct 公网基础地址
+	WebRTCDirectAddresses       []string                 // 兼容旧调用方的完整 WebRTC Direct 公网地址
+	NetworkInfo                 *NetworkInfo             // 运行时网络信息；用于在 host 监听后填充地址
+	AccessMode                  string                   // private / public；只用于兼容运维信息展示
+	WhitelistSize               int                      // private 白名单条数；只展示数量，不返回公钥本身
+	Retention                   time.Duration            // invalid 派生数据保留期，用于兼容运维信息
+	ReadMetrics                 func() map[string]uint64 // 受保护的 MSFile Read 计数；不含 Hash/字节
 }
 
 // New 创建公共内容服务 http.Handler。
@@ -116,8 +118,9 @@ func New(db *indexdb.DB, coord Coordinator, options Options) http.Handler {
 	// 不会产生 ServeMux 模式冲突。
 	mux.Handle("/", securityHeaders(fileServer))
 
-	// 公共内容 API 不要求管理令牌；它们只返回当前有效内容，并由下载处理器
-	// 在服务端通过 safefs.Root 打开原文件。兼容运维 API 仍单独受令牌保护。
+	// public 模式的内容 API 不要求管理令牌；它们只返回当前有效内容，并由下载处理器
+	// 在服务端通过 safefs.Root 打开原文件。private 白名单模式由处理器统一拒绝；
+	// 兼容运维 API 仍单独受令牌保护。
 	mux.HandleFunc("GET /api/files", server.listFiles)
 	mux.HandleFunc("/api/files", server.methodNotAllowed)
 	mux.HandleFunc("GET /api/files/{seed_hash}", server.fileDetail)
@@ -202,7 +205,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		lastScan = &scans[0]
 	}
 	network := s.network()
-	writeJSON(w, 200, map[string]any{
+	response := map[string]any{
 		"service_status":                 "running",
 		"service_status_zh":              "运行中",
 		"time":                           time.Now().UTC().Format(time.RFC3339),
@@ -217,7 +220,11 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		"queue_depth":                    s.coord.QueueDepth(),                     // 待处理路径队列深度
 		"last_scan":                      lastScan,                                 // 最近一次扫描记录
 		"retention_seconds":              int64(s.options.Retention / time.Second), // 失效保留期
-	})
+	}
+	if s.options.ReadMetrics != nil {
+		response["msfile_read_metrics"] = s.options.ReadMetrics()
+	}
+	writeJSON(w, 200, response)
 }
 
 // networkInfo 返回拨号方所需的最小公开网络信息。
@@ -237,7 +244,25 @@ func (s *Server) networkInfo(w http.ResponseWriter, r *http.Request) {
 		"peer_id":                 network.peerID,
 		"supplier_public_key":     network.supplierPublicKey,
 		"webrtc_direct_addresses": directAddresses,
+		"content_index_enabled":   s.contentIndexEnabled(), // 仅 public 模式开放 Web 文件列表、详情和下载
 	})
+}
+
+// contentIndexEnabled 报告 Web 公共内容能力是否开放。
+// 只有显式 access_mode: public 才开放；private（public_key_whitelist 白名单）模式默认关闭。
+func (s *Server) contentIndexEnabled() bool {
+	return s.options.AccessMode == config.AccessModePublic
+}
+
+// requirePublicContent 阻止白名单模式通过 HTTP 访问内容索引、详情和下载。
+// MSFile 客户端仍按 connection 层的公钥白名单执行 Stat/Read，不受这里影响。
+func (s *Server) requirePublicContent(w http.ResponseWriter) bool {
+	if s.contentIndexEnabled() {
+		return true
+	}
+	writeError(w, http.StatusForbidden, "content_index_disabled",
+		"当前为 public_key_whitelist 白名单模式，Web 不提供文件列表、详情和下载")
+	return false
 }
 
 func (s *Server) network() networkSnapshot {
@@ -268,6 +293,9 @@ func (s *Server) network() networkSnapshot {
 }
 
 func (s *Server) listFiles(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePublicContent(w) {
+		return
+	}
 	query := r.URL.Query()
 	limit, _ := strconv.Atoi(query.Get("limit"))
 	offset, _ := strconv.Atoi(query.Get("offset"))
@@ -296,6 +324,9 @@ func (s *Server) listFiles(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) fileDetail(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePublicContent(w) {
+		return
+	}
 	hashHex := strings.ToLower(strings.TrimSpace(r.PathValue("seed_hash")))
 	if _, err := hex.DecodeString(hashHex); err != nil || len(hashHex) != 64 {
 		writeError(w, 400, "invalid_seed_hash", "Seed Hash 必须是 64 位小写 hex")
@@ -373,6 +404,9 @@ func validFilenames(locations []indexdb.LocationDetail) []string {
 // download 提供公共文件下载。文件名来自索引中的 recommended_filename，
 // 但文件内容只能由 content.Reader 从当前 valid 副本安全打开。
 func (s *Server) download(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePublicContent(w) {
+		return
+	}
 	hashHex := strings.ToLower(strings.TrimSpace(r.PathValue("seed_hash")))
 	if _, err := hex.DecodeString(hashHex); err != nil || len(hashHex) != 64 {
 		writeError(w, http.StatusBadRequest, "invalid_seed_hash", "Seed Hash 必须是 64 位小写 hex")
